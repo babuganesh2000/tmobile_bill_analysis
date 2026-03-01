@@ -48,9 +48,9 @@ def pd(text: str) -> str:
 
 def extract_bill(pdf_path: str) -> dict:
     fname = os.path.basename(pdf_path)
-    with pdfplumber.open(pdf_path) as pdf:
-        p1 = pdf.pages[0].extract_text() or ""
-        p2 = pdf.pages[1].extract_text() or "" if len(pdf.pages) > 1 else ""
+    pdf = pdfplumber.open(pdf_path)
+    p1 = pdf.pages[0].extract_text() or ""
+    p2 = pdf.pages[1].extract_text() or "" if len(pdf.pages) > 1 else ""
 
     # ── invoice header (page 1) ──────────────────────────────────────
     def s1(pat, default=""):
@@ -236,7 +236,139 @@ def extract_bill(pdf_path: str) -> dict:
             amount=pm(m.group(3)),
         ))
 
-    return dict(invoice=invoice, lines=lines, savings=savings, payments=payments)
+    # ── usage details (requires full PDF still open) ──────────────────
+    try:
+        usage_data = extract_usage_details(pdf, bill_date, fname)
+    except Exception as e:
+        print(f"  Warning: usage extraction failed ({e}), skipping usage for {fname}")
+        usage_data = {"line_usage": [], "account_usage": {"file_name": fname, "bill_date": bill_date, "total_talk_minutes": 0, "total_messages": 0, "total_data_gb": 0.0}}
+    pdf.close()
+
+    return dict(
+        invoice=invoice, lines=lines, savings=savings, payments=payments,
+        line_usage=usage_data["line_usage"],
+        account_usage=usage_data["account_usage"],
+    )
+
+
+# ─── Usage detail extraction ───────────────────────────────────────
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+def _safe_extract_text(page, timeout=15):
+    """Extract text from a PDF page with a timeout to handle pdfminer hangs."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(page.extract_text)
+        try:
+            return future.result(timeout=timeout) or ""
+        except (FuturesTimeout, Exception):
+            return ""
+
+def extract_usage_details(pdf, bill_date: str, file_name: str) -> dict:
+    """Extract per-line usage (talk minutes, data GB) from USAGE DETAILS pages."""
+    # 1) Parse "YOU USED" summary from pages 2-3
+    line_data_gb = {}
+    total_talk = 0
+    total_msgs = 0
+    total_data_gb = 0.0
+
+    for i in [1, 2]:
+        if i >= len(pdf.pages):
+            break
+        text = _safe_extract_text(pdf.pages[i])
+        for m in re.finditer(r"\((\d{3})\)\s*(\d{3}-\d{4})\s+([\d.]+)GB", text):
+            phone = f"({m.group(1)}) {m.group(2)}"
+            line_data_gb[phone] = float(m.group(3))
+        for m in re.finditer(r"([\d,]+)\s+minutes\s+of\s+talk", text):
+            total_talk = int(m.group(1).replace(",", ""))
+        for m in re.finditer(r"([\d,]+)\s+messages", text):
+            total_msgs = int(m.group(1).replace(",", ""))
+        for m in re.finditer(r"([\d,.]+)\s*GB\s+of\s+data", text):
+            total_data_gb = float(m.group(1).replace(",", ""))
+
+    # 2) Parse USAGE DETAILS pages for per-line talk_minutes and data_mb
+    line_usage_map = {}
+    phone_sections = {}
+    active_phone_by_section = {}
+
+    for page_idx in range(4, len(pdf.pages)):
+        text = _safe_extract_text(pdf.pages[page_idx])
+        if not text:
+            continue
+        events = []
+
+        for m in re.finditer(
+            r"\((\d{3})\)\s*(\d{3}-\d{4})\s+\w+ \d+\s*-\s*\w+ \d+", text
+        ):
+            phone = f"({m.group(1)}) {m.group(2)}"
+            events.append((m.start(), "header", phone, None))
+
+        for m in re.finditer(
+            r"CONTINUED\s*-\s*\((\d{3})\)\s*(\d{3}-\d{4})\s*,\s*(\w+)", text
+        ):
+            phone = f"({m.group(1)}) {m.group(2)}"
+            section = m.group(3).upper()
+            events.append((m.start(), "continued", phone, section))
+
+        for m in re.finditer(r"Totals\s+([\d,]+\.?\d*)\s+\$[\d,.]+", text):
+            val_str = m.group(1).replace(",", "")
+            events.append((m.start(), "totals_num", None, val_str))
+
+        events.sort(key=lambda x: x[0])
+
+        for _pos, etype, phone, val in events:
+            if etype == "header":
+                if phone not in line_usage_map:
+                    line_usage_map[phone] = {"talk_minutes": 0, "data_mb": 0.0}
+                if phone not in phone_sections:
+                    phone_sections[phone] = set()
+                active_phone_by_section["TALK"] = phone
+            elif etype == "continued":
+                if phone not in line_usage_map:
+                    line_usage_map[phone] = {"talk_minutes": 0, "data_mb": 0.0}
+                if phone not in phone_sections:
+                    phone_sections[phone] = set()
+                active_phone_by_section[val] = phone
+            elif etype == "totals_num":
+                val_f = float(val)
+                if "." in val and len(val.split(".")[1]) > 2:
+                    target = active_phone_by_section.get("DATA")
+                    if not target:
+                        for s in ["DATA", "TEXT", "TALK"]:
+                            if s in active_phone_by_section:
+                                target = active_phone_by_section[s]
+                                break
+                    if target and "data" not in phone_sections.get(target, set()):
+                        line_usage_map[target]["data_mb"] = val_f
+                        phone_sections.setdefault(target, set()).add("data")
+                else:
+                    target = active_phone_by_section.get("TALK")
+                    if target and "talk" not in phone_sections.get(target, set()):
+                        line_usage_map[target]["talk_minutes"] = int(val_f)
+                        phone_sections.setdefault(target, set()).add("talk")
+
+    # Merge
+    all_phones = set(line_data_gb.keys()) | set(line_usage_map.keys())
+    line_usage_list = []
+    for phone in sorted(all_phones):
+        talk_min = line_usage_map.get(phone, {}).get("talk_minutes", 0)
+        data_mb = line_usage_map.get(phone, {}).get("data_mb", 0.0)
+        data_gb = line_data_gb.get(phone, data_mb / 1024.0)
+        if data_gb > 0 and data_mb == 0:
+            data_mb = data_gb * 1024.0
+        line_usage_list.append(dict(
+            file_name=file_name, bill_date=bill_date, phone_number=phone,
+            talk_minutes=talk_min, data_mb=round(data_mb, 4),
+            data_gb=data_gb,
+        ))
+
+    account_usage = dict(
+        file_name=file_name, bill_date=bill_date,
+        total_talk_minutes=total_talk, total_messages=total_msgs,
+        total_data_gb=total_data_gb,
+    )
+
+    return dict(line_usage=line_usage_list, account_usage=account_usage)
 
 
 # ─── DDL ────────────────────────────────────────────────────────────
@@ -316,6 +448,24 @@ CREATE TABLE IF NOT EXISTS payments (
     amount       DECIMAL(10,2)
 );
 
+CREATE TABLE IF NOT EXISTS line_usage (
+    file_name        VARCHAR,
+    bill_date        DATE,
+    phone_number     VARCHAR,
+    talk_minutes     INTEGER,
+    data_mb          DECIMAL(12,4),
+    data_gb          DECIMAL(10,2),
+    PRIMARY KEY (file_name, phone_number)
+);
+
+CREATE TABLE IF NOT EXISTS account_usage (
+    file_name            VARCHAR PRIMARY KEY,
+    bill_date            DATE,
+    total_talk_minutes   INTEGER,
+    total_messages       INTEGER,
+    total_data_gb        DECIMAL(10,2)
+);
+
 CREATE OR REPLACE VIEW person_monthly_cost AS
 SELECT
     p.person_id,
@@ -348,6 +498,35 @@ SELECT
     SUM(line_total)       AS grand_total
 FROM person_monthly_cost
 GROUP BY person_id, person_label;
+
+CREATE OR REPLACE VIEW line_usage_monthly AS
+SELECT
+    lu.bill_date,
+    i.bill_month,
+    lu.phone_number,
+    l.line_type,
+    lu.talk_minutes,
+    lu.data_mb,
+    lu.data_gb,
+    lc.line_total
+FROM line_usage lu
+JOIN invoices i ON i.file_name = lu.file_name
+LEFT JOIN lines l ON l.phone_number = lu.phone_number
+LEFT JOIN line_charges lc ON lc.file_name = lu.file_name AND lc.phone_number = lu.phone_number;
+
+CREATE OR REPLACE VIEW usage_summary AS
+SELECT
+    au.bill_date,
+    i.bill_month,
+    au.total_talk_minutes,
+    au.total_messages,
+    au.total_data_gb,
+    i.total_due,
+    i.voice_line_count,
+    i.connected_device_count,
+    i.wearable_count
+FROM account_usage au
+JOIN invoices i ON i.file_name = au.file_name;
 """
 
 # ─── load helpers ───────────────────────────────────────────────────
@@ -379,6 +558,17 @@ def load_payments(con, recs):
         con.execute("INSERT INTO payments VALUES (?,?,?,?,?)",
             [r["file_name"], r["bill_date"], r["entry_type"],
              r["description"], r["amount"]])
+
+def load_line_usage(con, recs):
+    for r in recs:
+        con.execute("INSERT OR REPLACE INTO line_usage VALUES (?,?,?,?,?,?)",
+            [r["file_name"], r["bill_date"], r["phone_number"],
+             r["talk_minutes"], r["data_mb"], r["data_gb"]])
+
+def load_account_usage(con, au):
+    con.execute("INSERT OR REPLACE INTO account_usage VALUES (?,?,?,?,?)",
+        [au["file_name"], au["bill_date"], au["total_talk_minutes"],
+         au["total_messages"], au["total_data_gb"]])
 
 
 def build_lines_dimension(con):
@@ -463,6 +653,11 @@ def main():
         load_line_charges(con, data["lines"])
         load_savings(con, data["savings"])
         load_payments(con, data["payments"])
+        load_line_usage(con, data["line_usage"])
+        load_account_usage(con, data["account_usage"])
+        au = data["account_usage"]
+        print(f"  Usage: {au['total_talk_minutes']} min talk, {au['total_messages']} msgs, "
+              f"{au['total_data_gb']} GB data, {len(data['line_usage'])} lines")
 
     print("\nBuilding dimensions...")
     build_lines_dimension(con)
@@ -531,7 +726,8 @@ def main():
         print(f"{str(r[0]):<12}{float(r[1]):>10.2f}{float(r[2]):>12.2f}{float(r[3]):>10.2f}{flag}")
 
     print("\n─── ROW COUNTS ───")
-    for tbl in ["invoices", "line_charges", "lines", "persons", "person_lines", "savings", "payments"]:
+    for tbl in ["invoices", "line_charges", "lines", "persons", "person_lines",
+                 "savings", "payments", "line_usage", "account_usage"]:
         cnt = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
         print(f"  {tbl:<18} {cnt:>5} rows")
 
