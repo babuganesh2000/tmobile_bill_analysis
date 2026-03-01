@@ -78,6 +78,7 @@ page = st.sidebar.radio(
         "Overview",
         "Monthly Trends",
         "Line Analysis",
+        "Line Cost by Month",
         "Usage Details",
         "Person View",
         "Savings & Discounts",
@@ -418,6 +419,224 @@ elif page == "Line Analysis":
         )
         fig.update_layout(height=600)
         st.plotly_chart(fig, width='stretch')
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PAGE: Line Cost by Month
+# ════════════════════════════════════════════════════════════════════
+
+elif page == "Line Cost by Month":
+    st.title("Line Cost by Month")
+
+    # ── Separate line-level vs account-level charges ───────────────
+    all_cost = line_charges.copy()
+    all_cost["bill_date"] = pd.to_datetime(all_cost["bill_date"])
+    all_cost["month"] = all_cost["bill_date"].apply(
+        lambda d: d.strftime("%b %Y") if hasattr(d, "strftime") else str(d)[:7]
+    )
+    all_months_sorted = invoices.sort_values("bill_date")["label"].tolist()
+
+    line_data = all_cost[all_cost["phone_number"] != "Account"].copy()
+    acct_data = all_cost[all_cost["phone_number"] == "Account"].copy()
+
+    # Per-month: account charge & number of active lines
+    acct_per_month = acct_data.groupby("month")["line_total"].sum()
+    lines_per_month = line_data.groupby("month")["phone_number"].nunique()
+    share_per_month = (acct_per_month / lines_per_month).fillna(0)  # per-line account share
+
+    # ── Filters ────────────────────────────────────────────────────
+    st.markdown("##### Filters")
+    fc1, fc2, fc3 = st.columns([2, 2, 2])
+
+    with fc1:
+        preset = st.selectbox(
+            "Time range",
+            ["All months", "Last 3 months", "Last 6 months", "Last 12 months",
+             "Year: 2024", "Year: 2025", "Year: 2026", "Custom range"],
+            index=0,
+        )
+
+    if preset == "Last 3 months":
+        cutoff_months = all_months_sorted[-3:]
+    elif preset == "Last 6 months":
+        cutoff_months = all_months_sorted[-6:]
+    elif preset == "Last 12 months":
+        cutoff_months = all_months_sorted[-12:]
+    elif preset.startswith("Year:"):
+        yr = preset.split(":")[1].strip()
+        cutoff_months = [m for m in all_months_sorted if m.endswith(yr)]
+    elif preset == "Custom range":
+        with fc2:
+            start_m = st.selectbox("From month", all_months_sorted, index=0)
+        with fc3:
+            end_m = st.selectbox("To month", all_months_sorted, index=len(all_months_sorted) - 1)
+        si = all_months_sorted.index(start_m)
+        ei = all_months_sorted.index(end_m)
+        if si > ei:
+            si, ei = ei, si
+        cutoff_months = all_months_sorted[si:ei + 1]
+    else:
+        cutoff_months = all_months_sorted
+
+    with fc2 if preset != "Custom range" else st.columns([1])[0]:
+        line_types = ["All lines"] + sorted(lines_dim["line_type"].unique().tolist())
+        sel_type = st.selectbox("Line type", line_types, index=0)
+
+    # Apply filters
+    filtered = line_data[line_data["month"].isin(cutoff_months)].copy()
+    if sel_type != "All lines":
+        type_phones = lines_dim[lines_dim["line_type"] == sel_type]["phone_number"].tolist()
+        filtered = filtered[filtered["phone_number"].isin(type_phones)]
+
+    if filtered.empty:
+        st.warning("No data for the selected filters.")
+        st.stop()
+
+    month_order = [m for m in all_months_sorted if m in cutoff_months]
+
+    # ── Build line-charge pivot ────────────────────────────────────
+    line_pivot = filtered.pivot_table(index="phone_number", columns="month",
+                                       values="line_total", aggfunc="sum")
+    line_pivot = line_pivot.reindex(columns=[m for m in month_order if m in line_pivot.columns])
+
+    # ── Build account-share pivot (same shape, each cell = share) ──
+    acct_share_pivot = line_pivot.copy()
+    for m in acct_share_pivot.columns:
+        # Only assign share where the line was active (has a charge)
+        acct_share_pivot[m] = acct_share_pivot[m].apply(
+            lambda v: round(share_per_month.get(m, 0), 2) if pd.notna(v) else None
+        )
+
+    # ── Combined pivot (line charge + account share) ───────────────
+    combined_pivot = line_pivot.fillna(0) + acct_share_pivot.fillna(0)
+    # Restore NaN where line wasn't active
+    combined_pivot[line_pivot.isna()] = None
+
+    # Add summary columns
+    for pv, prefix in [(line_pivot, "Line"), (acct_share_pivot, "Acct Share"), (combined_pivot, "Total Due")]:
+        pv[prefix + " TOTAL"] = pv[month_order].sum(axis=1, min_count=1)
+
+    # Add TOTAL row to combined
+    totals_row = combined_pivot.sum()
+    totals_row.name = "TOTAL"
+    combined_pivot_display = pd.concat([combined_pivot, totals_row.to_frame().T])
+
+    n_months = len(month_order)
+    n_lines = len(line_pivot)
+
+    # ── KPIs ───────────────────────────────────────────────────────
+    grand_total = combined_pivot_display.loc["TOTAL", "Total Due TOTAL"]
+    acct_total_period = float(acct_share_pivot["Acct Share TOTAL"].sum())
+    line_total_period = float(line_pivot["Line TOTAL"].sum())
+    share_example = share_per_month.get(month_order[-1], 0) if month_order else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Grand Total", f"${grand_total:,.2f}")
+    k2.metric("Line Charges", f"${line_total_period:,.2f}")
+    k3.metric("Acct Share (all)", f"${acct_total_period:,.2f}")
+    k4.metric("Acct Share/Line (latest)", f"${share_example:,.2f}/mo")
+
+    st.caption(
+        "💡 **Account-level charges** (~$81/mo for plan fees & taxes) are divided equally "
+        f"among active lines each month. With {lines_per_month.get(month_order[-1], 0):.0f} lines "
+        f"in the latest month, each line's share is **${share_example:,.2f}/mo**. "
+        "The 'Total Due' column = Line Charge + Account Share."
+    )
+
+    st.divider()
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Total Due (Line + Acct Share)", "Line Charges Only", "Heatmap", "Stacked Bar"
+    ])
+
+    with tab1:
+        st.subheader("What Each Line Owes (incl. Account Share)")
+
+        # Build a clean display: months | Line TOTAL | Acct Share TOTAL | Total Due TOTAL
+        disp = combined_pivot_display.copy()
+        disp.insert(len(month_order), "Line TOTAL", line_pivot["Line TOTAL"])
+        disp.insert(len(month_order) + 1, "Acct Share", acct_share_pivot["Acct Share TOTAL"])
+        # Fill TOTAL row for the summary columns
+        disp.loc["TOTAL", "Line TOTAL"] = line_total_period
+        disp.loc["TOTAL", "Acct Share"] = acct_total_period
+        # Keep only month cols + 3 summary cols
+        display_cols = [m for m in month_order if m in disp.columns] + ["Line TOTAL", "Acct Share", "Total Due TOTAL"]
+        disp = disp[display_cols]
+
+        def _style_total_due(s):
+            if s.name == "TOTAL":
+                return ["font-weight:bold; background-color:#E20074; color:white"] * len(s)
+            return [""] * len(s)
+
+        styled = disp.style.format("${:,.2f}", na_rep="-").apply(
+            _style_total_due, axis=1
+        ).map(
+            lambda _: "font-weight:bold",
+            subset=pd.IndexSlice[:, ["Line TOTAL", "Acct Share", "Total Due TOTAL"]]
+        ).map(
+            lambda _: "background-color:#E8F5E9",
+            subset=pd.IndexSlice[:, "Total Due TOTAL"]
+        ).map(
+            lambda _: "background-color:#FFF3CD",
+            subset=pd.IndexSlice[:, "Acct Share"]
+        )
+        tbl_height = min(750, 60 + 35 * (n_lines + 2))
+        st.dataframe(styled, width="stretch", height=tbl_height)
+
+    with tab2:
+        st.subheader("Line Charges Only (excl. Account Share)")
+        line_disp = line_pivot.copy()
+        lt_row = line_disp.sum()
+        lt_row.name = "TOTAL"
+        line_disp = pd.concat([line_disp, lt_row.to_frame().T])
+
+        def _style_line_only(s):
+            if s.name == "TOTAL":
+                return ["font-weight:bold; background-color:#E20074; color:white"] * len(s)
+            return [""] * len(s)
+
+        styled2 = line_disp.style.format("${:,.2f}", na_rep="-").apply(
+            _style_line_only, axis=1
+        ).map(
+            lambda _: "font-weight:bold",
+            subset=pd.IndexSlice[:, "Line TOTAL"]
+        )
+        tbl_height2 = min(750, 60 + 35 * (n_lines + 2))
+        st.dataframe(styled2, width="stretch", height=tbl_height2)
+
+    with tab3:
+        st.subheader("Total Due Heatmap")
+        heat = combined_pivot.drop(columns=["Total Due TOTAL"], errors="ignore")
+        fig = px.imshow(
+            heat.fillna(0).values,
+            x=heat.columns.tolist(), y=heat.index.tolist(),
+            color_continuous_scale=[[0, "#FFF0F6"], [0.5, "#E20074"], [1, "#8B004A"]],
+            aspect="auto",
+            title="Total Due Heatmap — Line Charge + Account Share (Phone × Month)",
+            labels=dict(x="Month", y="Phone Number", color="$ Amount"),
+        )
+        fig.update_traces(text=heat.fillna(0).map(lambda v: f"${v:,.0f}").values,
+                          texttemplate="%{text}", textfont_size=10)
+        fig.update_layout(height=max(400, 45 * n_lines + 100))
+        st.plotly_chart(fig, width="stretch")
+
+    with tab4:
+        st.subheader("Monthly Total Due by Line (Stacked)")
+        # Build bar data from combined (line + share)
+        bar_src = filtered.copy()
+        bar_src["acct_share"] = bar_src["month"].map(share_per_month).fillna(0)
+        bar_src["total_due"] = bar_src["line_total"] + bar_src["acct_share"]
+        bar_data = bar_src.groupby(["month", "phone_number"])["total_due"].sum().reset_index()
+        bar_data["month"] = pd.Categorical(bar_data["month"], categories=month_order, ordered=True)
+        bar_data = bar_data.sort_values("month")
+        fig = px.bar(
+            bar_data, x="month", y="total_due", color="phone_number",
+            title="Monthly Total Due by Line (incl. Account Share)",
+            labels={"month": "Month", "total_due": "Total Due ($)", "phone_number": "Phone"},
+            barmode="stack",
+        )
+        fig.update_layout(xaxis_tickangle=-45, height=550, legend=dict(font=dict(size=9)))
+        st.plotly_chart(fig, width="stretch")
 
 
 # ════════════════════════════════════════════════════════════════════
