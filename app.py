@@ -154,11 +154,33 @@ if page == "Upload Bills":
         n = run_query("SELECT COUNT(*) AS n FROM invoices").iloc[0, 0]
         st.caption(f"{n} bill(s) loaded")
 
-        if st.button("Clear All Data", type="secondary"):
-            con = get_con()
-            for t in ["payments", "savings", "person_lines", "persons", "lines", "line_charges", "invoices"]:
-                con.execute(f"DELETE FROM {t}")
-            st.rerun()
+        st.divider()
+        st.subheader("Reset Database")
+        st.caption("Delete **all** loaded bills and start from scratch with an empty database.")
+        if st.button("Delete All Data & Reset", type="secondary"):
+            st.session_state["confirm_reset"] = True
+
+        if st.session_state.get("confirm_reset"):
+            st.warning("This will permanently delete every bill from the local database. Are you sure?")
+            c1, c2 = st.columns(2)
+            if c1.button("Yes, delete everything", type="primary"):
+                # Close existing connection
+                con = get_con()
+                con.close()
+                st.session_state["db_con"] = None
+                # Remove old DB file and create a fresh one
+                db_path = st.session_state["db_path"]
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                new_con = duckdb.connect(db_path)
+                init_schema(new_con)
+                st.session_state["db_con"] = new_con
+                st.session_state.pop("confirm_reset", None)
+                st.success("Database reset to empty. Upload new PDFs to begin.")
+                st.rerun()
+            if c2.button("Cancel"):
+                st.session_state.pop("confirm_reset", None)
+                st.rerun()
     else:
         st.info("No bills loaded yet. Upload PDFs above to get started.")
 
