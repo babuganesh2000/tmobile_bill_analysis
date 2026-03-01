@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Sensitive billing PDFs (do NOT commit)
+*.pdf
+
+# Working copies of DB (seed DB in data/ IS committed)
+/*.duckdb
+*.duckdb.wal
+!data/tmobile_bills.duckdb
+
+# Excel exports
+*.xlsx
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
