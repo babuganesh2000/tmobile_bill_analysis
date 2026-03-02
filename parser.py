@@ -154,28 +154,30 @@ GROUP BY person_id, person_label;
 
 # ─── helpers: detailed-charges plan extraction ─────────────────────
 
-def _extract_device_plan_charges(pdf, start_page: int = 1) -> dict:
+def _extract_real_plan_charges(pdf, start_page: int = 1) -> dict:
     """
-    Scan the DETAILED CHARGES pages for CONNECTED DEVICES and WEARABLE
-    sections and return the *real* per-line plan charges.
+    Scan the DETAILED CHARGES pages for VOICE LINES, CONNECTED DEVICES,
+    and WEARABLE sections and return the *real* per-line plan charges.
 
     T-Mobile's summary table rolls taxes/fees into the 'Plans' column
-    for MI and Wearable lines (so Plans == Total, Services == 0).
+    for ALL line types (Plans == Plan + Taxes, Services shows only add-ons).
     The detailed section lists the actual plan charge before taxes.
 
-    Returns  {phone_number: total_plan_charge}  (accumulated for mid-cycle).
+    Returns  {phone_or_account: plan_charge}  (accumulated for mid-cycle).
     """
     real_plan: dict[str, float] = {}
-    section: str | None = None          # "mi" or "wearable" while inside those blocks
+    section: str | None = None          # "voice", "mi", or "wearable"
 
-    _SECTION_START = re.compile(
-        r"CONNECTED\s+DEVICE|(?<!\d\s)WEARABLE(?!\s+\$)", re.IGNORECASE)
     _SECTION_RESET = re.compile(
         r"TAXES|EQUIPMENT|HANDSETS|YOUR\sLAST\sBILL|"
         r"THIS\sBILL\sSUMMARY|REGULAR\s+CHARGES|"
-        r"MID-CYCLE|VOICE\s+LINE", re.IGNORECASE)
+        r"MID-CYCLE|SERVICES", re.IGNORECASE)
     _PHONE_CHARGE = re.compile(
         r"(\(\d{3}\)\s*\d{3}-\d{4})\s+.+?\s+\$(\d+\.\d{2})")
+    _PHONE_INCLUDED = re.compile(
+        r"(\(\d{3}\)\s*\d{3}-\d{4})\s+.+?Included")
+    _ACCOUNT_CHARGE = re.compile(
+        r"Account\s+.+?\$(\d+\.\d{2})")
 
     # Scan only the first 6 pages after start_page (detailed charges appear early)
     end_page = min(start_page + 6, len(pdf.pages))
@@ -189,6 +191,10 @@ def _extract_device_plan_charges(pdf, start_page: int = 1) -> dict:
             # Detect section boundaries
             if _SECTION_RESET.search(stripped):
                 section = None
+            # Section starts (order matters: check after reset)
+            if "VOICE LINE" in stripped.upper() or "VOICE LINES" in stripped.upper():
+                section = "voice"
+                continue
             if "CONNECTED" in stripped and "DEVICE" in stripped:
                 section = "mi"
                 continue
@@ -196,9 +202,22 @@ def _extract_device_plan_charges(pdf, start_page: int = 1) -> dict:
                 section = "wearable"
                 continue
 
-            if section not in ("mi", "wearable"):
+            if section not in ("voice", "mi", "wearable"):
                 continue
 
+            # Account plan charge (only in voice section)
+            if section == "voice":
+                am = _ACCOUNT_CHARGE.match(stripped)
+                if am:
+                    real_plan["Account"] = float(am.group(1))
+                    continue
+                # "Included" lines: plan is $0 (covered by account charge)
+                im = _PHONE_INCLUDED.match(stripped)
+                if im:
+                    real_plan[im.group(1)] = 0.0
+                    continue
+
+            # Phone with explicit charge
             m = _PHONE_CHARGE.match(stripped)
             if m:
                 phone = m.group(1)
@@ -354,21 +373,19 @@ def extract_bill(source, file_name: str | None = None) -> dict:
             line_total=_pm(tot_c),
         ))
 
-    # ── fix MI/Wearable plan charges ─────────────────────────────────
-    # Summary table bundles taxes/fees into the "Plans" column for
-    # Connected Devices and Wearable lines.  Extract the real plan
-    # charges from the DETAILED CHARGES section and move the
-    # tax portion into services_charge.
-    real_plan = _extract_device_plan_charges(pdf, start_page=1)
+    # ── fix plan charges for ALL line types ────────────────────────
+    # T-Mobile's summary table bundles taxes/fees into the "Plans"
+    # column for all line types.  Extract the real plan charges from
+    # the DETAILED CHARGES section so we can compute:
+    #   taxes = line_total - plans_charge - equipment - services - onetime
+    real_plan = _extract_real_plan_charges(pdf, start_page=1)
     for entry in line_list:
-        if entry["line_type"] in ("Mobile Internet", "Wearable"):
-            phone = entry["phone_number"]
-            if phone in real_plan:
-                old_plans = entry["plans_charge"]
-                new_plans = round(real_plan[phone], 2)
-                if 0 < new_plans < old_plans:
-                    entry["services_charge"] = round(old_plans - new_plans, 2)
-                    entry["plans_charge"] = new_plans
+        phone = entry["phone_number"]
+        if phone in real_plan:
+            old_plans = entry["plans_charge"]
+            new_plans = round(real_plan[phone], 2)
+            if new_plans < old_plans:
+                entry["plans_charge"] = new_plans
 
     # ── savings ──────────────────────────────────────────────────────
     sav = []

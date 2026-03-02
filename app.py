@@ -675,10 +675,18 @@ elif page == "Line Analysis":
         fig.update_layout(xaxis_tickangle=-45)
         st.plotly_chart(fig, width='stretch')
 
-        melt = ph_data[["label", "plans_charge", "equipment_charge", "services_charge", "onetime_charge"]].melt(
+        melt_src = ph_data[["label", "plans_charge", "equipment_charge", "services_charge", "onetime_charge", "line_total"]].copy()
+        melt_src["taxes_fees"] = (melt_src["line_total"] - melt_src["plans_charge"]
+                                   - melt_src["equipment_charge"] - melt_src["services_charge"]
+                                   - melt_src["onetime_charge"]).round(2)
+        melt = melt_src[["label", "plans_charge", "equipment_charge", "services_charge", "onetime_charge", "taxes_fees"]].melt(
             id_vars="label", var_name="Category", value_name="Amount"
         )
-        melt["Category"] = melt["Category"].str.replace("_charge", "").str.title()
+        melt["Category"] = melt["Category"].map({
+            "plans_charge": "Plan", "equipment_charge": "Equipment",
+            "services_charge": "Services", "onetime_charge": "One-Time",
+            "taxes_fees": "Taxes & Fees",
+        })
         fig2 = px.bar(melt, x="label", y="Amount", color="Category",
                        title=f"Charge Breakdown -- {selected_phone}", barmode="stack")
         fig2.update_layout(xaxis_tickangle=-45)
@@ -978,18 +986,25 @@ elif page == "Person View":
         fig.update_layout(xaxis_tickangle=-45)
         st.plotly_chart(fig, width='stretch')
 
+        _plan_sum = float(p_data["plans_charge"].sum())
+        _equip_sum = float(p_data["equipment_charge"].sum())
+        _svc_sum = float(p_data["services_charge"].sum())
+        _ot_sum = float(p_data["onetime_charge"].sum())
+        _total_sum = float(p_data["line_total"].sum())
+        _tax_sum = round(_total_sum - _plan_sum - _equip_sum - _svc_sum - _ot_sum, 2)
         cats = {
-            "Plans": float(p_data["plans_charge"].sum()),
-            "Equipment": float(p_data["equipment_charge"].sum()),
-            "Services": float(p_data["services_charge"].sum()),
-            "One-Time": float(p_data["onetime_charge"].sum()),
+            "Plan": _plan_sum,
+            "Equipment": _equip_sum,
+            "Services": _svc_sum,
+            "One-Time": _ot_sum,
+            "Taxes & Fees": _tax_sum,
         }
         cats = {k: v for k, v in cats.items() if v != 0}
         if cats:
             fig2 = px.pie(
                 names=list(cats.keys()), values=list(cats.values()),
                 title=f"Charge Mix - {sel_person}",
-                color_discrete_sequence=["#E20074", "#5C2D91", "#0078D4", "#FFB900"],
+                color_discrete_sequence=["#E20074", "#5C2D91", "#0078D4", "#FFB900", "#107C10"],
             )
             st.plotly_chart(fig2, width='stretch')
 
@@ -1077,25 +1092,39 @@ elif page == "Bill Splitup":
                   "plans_charge", "equipment_charge", "services_charge",
                   "onetime_charge", "line_total"]].copy()
         bd.columns = ["Name", "Phone", "Type", "Status",
-                       "Plans", "Equipment", "Services", "One-Time", "Total"]
+                       "Plan", "Equipment", "Services", "One-Time", "Total"]
+        # Compute Taxes & Fees = Total - Plan - Equipment - Services - One-Time
+        bd["Taxes & Fees"] = (bd["Total"] - bd["Plan"] - bd["Equipment"]
+                              - bd["Services"] - bd["One-Time"]).round(2)
 
+        acct_plan = float(acct_rows["plans_charge"].sum()) if not acct_rows.empty else 0
+        acct_equip = float(acct_rows["equipment_charge"].sum()) if not acct_rows.empty else 0
+        acct_svc = float(acct_rows["services_charge"].sum()) if not acct_rows.empty else 0
+        acct_ot = float(acct_rows["onetime_charge"].sum()) if not acct_rows.empty else 0
+        acct_tax = round(acct_total - acct_plan - acct_equip - acct_svc - acct_ot, 2)
         acct_r = pd.DataFrame([{
             "Name": "Account", "Phone": "", "Type": "Account", "Status": "",
-            "Plans": float(acct_rows["plans_charge"].sum()) if not acct_rows.empty else 0,
-            "Equipment": float(acct_rows["equipment_charge"].sum()) if not acct_rows.empty else 0,
-            "Services": float(acct_rows["services_charge"].sum()) if not acct_rows.empty else 0,
-            "One-Time": float(acct_rows["onetime_charge"].sum()) if not acct_rows.empty else 0,
+            "Plan": acct_plan,
+            "Equipment": acct_equip,
+            "Services": acct_svc,
+            "One-Time": acct_ot,
+            "Taxes & Fees": acct_tax,
             "Total": acct_total,
         }])
         bd = pd.concat([bd, acct_r], ignore_index=True)
 
         t_row = pd.DataFrame([{
             "Name": "TOTAL", "Phone": "", "Type": "", "Status": "",
-            "Plans": bd["Plans"].sum(), "Equipment": bd["Equipment"].sum(),
+            "Plan": bd["Plan"].sum(), "Equipment": bd["Equipment"].sum(),
             "Services": bd["Services"].sum(), "One-Time": bd["One-Time"].sum(),
+            "Taxes & Fees": bd["Taxes & Fees"].sum(),
             "Total": bd["Total"].sum(),
         }])
         bd = pd.concat([bd, t_row], ignore_index=True)
+
+        # Reorder columns: Plan, Equipment, Services, One-Time, Taxes & Fees, Total
+        bd = bd[["Name", "Phone", "Type", "Status",
+                  "Plan", "Equipment", "Services", "One-Time", "Taxes & Fees", "Total"]]
 
         def _style_bd(row):
             if row["Name"] == "TOTAL":
@@ -1108,9 +1137,9 @@ elif page == "Bill Splitup":
 
         st.dataframe(
             bd.style
-            .format({"Plans": "${:,.2f}", "Equipment": "${:,.2f}",
+            .format({"Plan": "${:,.2f}", "Equipment": "${:,.2f}",
                       "Services": "${:,.2f}", "One-Time": "${:,.2f}",
-                      "Total": "${:,.2f}"})
+                      "Taxes & Fees": "${:,.2f}", "Total": "${:,.2f}"})
             .apply(_style_bd, axis=1),
             use_container_width=True, hide_index=True,
             height=min(800, 60 + 35 * len(bd)),
@@ -1153,17 +1182,24 @@ elif page == "Bill Splitup":
                     acct_sh += equal_remainder
             else:
                 acct_sh = 0.0
+            plan_v = float(r["plans_charge"])
+            svc_v = float(r["services_charge"])
+            equip_v = float(r["equipment_charge"])
+            ot_v = float(r["onetime_charge"])
+            total_v = float(r["line_total"])
+            taxes_v = round(total_v - plan_v - equip_v - svc_v - ot_v, 2)
             split_rows.append({
                 "Name": r["Name"],
                 "Phone": r["phone_number"],
                 "Type": r["line_type"],
-                "Plan": float(r["plans_charge"]),
-                "Services": float(r["services_charge"]),
-                "Equipment": float(r["equipment_charge"]),
-                "One-Time": float(r["onetime_charge"]),
-                "Line Total": float(r["line_total"]),
+                "Plan": plan_v,
+                "Services": svc_v,
+                "Equipment": equip_v,
+                "One-Time": ot_v,
+                "Taxes & Fees": taxes_v,
+                "Line Total": total_v,
                 "Acct Share": round(acct_sh, 2),
-                "Month Total": round(float(r["line_total"]) + acct_sh, 2),
+                "Month Total": round(total_v + acct_sh, 2),
             })
 
         sp = pd.DataFrame(split_rows)
@@ -1171,6 +1207,7 @@ elif page == "Bill Splitup":
             "Name": "TOTAL", "Phone": "", "Type": "",
             "Plan": sp["Plan"].sum(), "Services": sp["Services"].sum(),
             "Equipment": sp["Equipment"].sum(), "One-Time": sp["One-Time"].sum(),
+            "Taxes & Fees": sp["Taxes & Fees"].sum(),
             "Line Total": sp["Line Total"].sum(),
             "Acct Share": sp["Acct Share"].sum(),
             "Month Total": sp["Month Total"].sum(),
@@ -1179,7 +1216,7 @@ elif page == "Bill Splitup":
 
         money = {c: "${:,.2f}" for c in
                  ["Plan", "Services", "Equipment", "One-Time",
-                  "Line Total", "Acct Share", "Month Total"]}
+                  "Taxes & Fees", "Line Total", "Acct Share", "Month Total"]}
 
         def _style_sp(row):
             if row["Name"] == "TOTAL":
@@ -1236,11 +1273,18 @@ elif page == "Bill Splitup":
                 st.plotly_chart(fig_pie1, use_container_width=True)
 
         with col2:
+            _a_plan = float(active["plans_charge"].sum())
+            _a_equip = float(active["equipment_charge"].sum())
+            _a_svc = float(active["services_charge"].sum())
+            _a_ot = float(active["onetime_charge"].sum())
+            _a_total = float(active["line_total"].sum())
+            _a_tax = round(_a_total - _a_plan - _a_equip - _a_svc - _a_ot, 2)
             cats = {
-                "Plans": float(active["plans_charge"].sum()),
-                "Equipment": float(active["equipment_charge"].sum()),
-                "Services": float(active["services_charge"].sum()),
-                "One-Time": float(active["onetime_charge"].sum()),
+                "Plan": _a_plan,
+                "Equipment": _a_equip,
+                "Services": _a_svc,
+                "One-Time": _a_ot,
+                "Taxes & Fees": _a_tax,
                 "Account": acct_total,
             }
             cats = {k: v for k, v in cats.items() if v != 0}
