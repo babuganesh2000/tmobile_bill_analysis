@@ -309,26 +309,60 @@ if _google_auth_enabled() and st.session_state.get("authenticated"):
         st.rerun()
     st.sidebar.divider()
 
-# Build nav list — add User Management for admins
-_nav_items = [
-    "Upload Bills",
-    "Overview",
-    "Monthly Trends",
-    "Line Analysis",
-    "Line Cost by Month",
-    "Usage Details",
-    "Person View",
-    "Bill Splitup",
-    "Savings & Discounts",
-    "Raw Data Explorer",
-]
-if st.session_state.get("user_role") == "admin":
-    _nav_items.append("User Management")
+# ── Grouped sidebar navigation ────────────────────────────────────
+_is_admin = st.session_state.get("user_role") == "admin"
 
-page = st.sidebar.radio(
-    "Navigate",
-    _nav_items,
-)
+# Define page groups — separators use "---" prefix so we can detect them
+_SEPARATOR = "---"
+_nav_items = []
+
+# Core (high priority)
+_nav_items.append(f"{_SEPARATOR}📋  CORE")
+_nav_items += ["Upload Bills", "Overview", "Monthly Trends", "Bill Splitup"]
+
+# Analytics (secondary)
+_nav_items.append(f"{_SEPARATOR}📊  ANALYTICS")
+_nav_items += ["Line Analysis", "Line Cost by Month", "Usage Details", "Person View"]
+
+# Reports
+_nav_items.append(f"{_SEPARATOR}📑  REPORTS")
+_nav_items += ["Savings & Discounts", "Raw Data Explorer"]
+
+# Admin (admin only)
+if _is_admin:
+    _nav_items.append(f"{_SEPARATOR}⚙️  ADMIN")
+    _nav_items += ["User Management", "Phone Directory"]
+
+# Render navigation — section headers are styled labels, pages are radio items
+# We use a callback-driven approach with buttons for headers, radio for pages
+def _render_nav():
+    """Render grouped navigation in the sidebar."""
+    selected = st.session_state.get("_nav_page", "Upload Bills")
+    for item in _nav_items:
+        if item.startswith(_SEPARATOR):
+            # Section header
+            label = item[len(_SEPARATOR):]
+            st.sidebar.markdown(
+                f"<div style='padding:8px 0 2px 0;font-size:0.75rem;font-weight:700;"
+                f"color:#888;letter-spacing:0.05em;text-transform:uppercase'>"
+                f"{label}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            # Page button — highlight if selected
+            is_active = (item == selected)
+            btn_type = "primary" if is_active else "secondary"
+            if st.sidebar.button(
+                item,
+                key=f"nav_{item}",
+                use_container_width=True,
+                type=btn_type,
+            ):
+                st.session_state["_nav_page"] = item
+                st.rerun()
+
+_render_nav()
+page = st.session_state.get("_nav_page", "Upload Bills")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -495,7 +529,7 @@ if page not in ("Upload Bills", "User Management") and has_data():
 #  PAGE: Overview
 # ════════════════════════════════════════════════════════════════════
 
-if page == "Overview":
+elif page == "Overview":
     st.title("Account Overview")
 
     total_spent = float(invoices["total_due"].sum())
@@ -1549,6 +1583,7 @@ elif page == "Raw Data Explorer":
         "person_total": "View: aggregated per-person totals",
         "line_usage_monthly": "View: per-line usage with bill month & charges",
         "usage_summary": "View: account-level usage with bill totals",
+        "phone_names": "Phone number to person name mappings",
     }
     for tbl, desc in tables_info.items():
         st.code(f"{tbl}  --  {desc}", language=None)
@@ -1635,4 +1670,119 @@ elif page == "User Management":
                 st.rerun()
         else:
             st.info("No removable users. Permanent admins cannot be removed.")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PAGE: Phone Directory (admin only)
+# ════════════════════════════════════════════════════════════════════
+
+elif page == "Phone Directory":
+    st.title("📞 Phone Directory")
+
+    if st.session_state.get("user_role") != "admin":
+        st.error("Admin access required.")
+        st.stop()
+
+    st.caption(
+        "Assign names to phone numbers. These names appear in **Bill Splitup**, "
+        "**Person View**, and all person-related charts. Changes take effect after "
+        "clicking **Save & Rebuild**."
+    )
+
+    bills_con = get_con()
+
+    # Ensure phone_names table exists
+    bills_con.execute("""
+        CREATE TABLE IF NOT EXISTS phone_names (
+            phone_number  VARCHAR PRIMARY KEY,
+            person_name   VARCHAR NOT NULL
+        )
+    """)
+
+    # Load all known phones from lines dimension
+    all_phones_df = bills_con.execute("""
+        SELECT l.phone_number, l.line_type, l.is_current, l.lifecycle_notes,
+               pn.person_name
+        FROM lines l
+        LEFT JOIN phone_names pn ON l.phone_number = pn.phone_number
+        ORDER BY l.line_type, l.phone_number
+    """).fetchdf()
+
+    if all_phones_df.empty:
+        st.info("No phone lines found. Upload bills first.")
+    else:
+        # Show current directory
+        st.subheader("Current Assignments")
+        dir_display = all_phones_df.copy()
+        dir_display["person_name"] = dir_display["person_name"].fillna("")
+        dir_display["status"] = dir_display.apply(
+            lambda r: "✅ Active" if r["is_current"] else f"❌ {r['lifecycle_notes']}", axis=1
+        )
+        dir_display = dir_display[["phone_number", "person_name", "line_type", "status"]]
+        dir_display.columns = ["Phone", "Name", "Type", "Status"]
+
+        def _style_dir(row):
+            if not row["Name"]:
+                return ["background:#FFF3CD"] * len(row)
+            return [""] * len(row)
+        st.dataframe(
+            dir_display.style.apply(_style_dir, axis=1),
+            use_container_width=True, hide_index=True,
+            height=min(600, 60 + 35 * len(dir_display)),
+        )
+        unnamed_ct = (dir_display["Name"] == "").sum()
+        if unnamed_ct:
+            st.caption(f"⚠️ **{unnamed_ct}** phone(s) without a name (highlighted yellow)")
+
+        st.divider()
+
+        # Edit form — one row per phone
+        st.subheader("Edit Names")
+        with st.form("phone_dir_form", clear_on_submit=False):
+            edited_names = {}
+            cols_per_row = 3
+            phones = all_phones_df["phone_number"].tolist()
+            current_names = all_phones_df["person_name"].fillna("").tolist()
+            line_types = all_phones_df["line_type"].tolist()
+
+            for i in range(0, len(phones), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for j, col in enumerate(row_cols):
+                    idx = i + j
+                    if idx < len(phones):
+                        phone = phones[idx]
+                        cur = current_names[idx]
+                        ltype = line_types[idx]
+                        icon = "📱" if ltype == "Voice" else ("📡" if ltype == "Mobile Internet" else "⌚")
+                        edited_names[phone] = col.text_input(
+                            f"{icon} {phone}",
+                            value=cur,
+                            key=f"pn_{phone}",
+                            placeholder="Enter name",
+                        )
+
+            save_btn = st.form_submit_button("💾 Save & Rebuild", type="primary")
+
+        if save_btn:
+            changes = 0
+            for phone, name in edited_names.items():
+                name = name.strip()
+                if name:
+                    bills_con.execute(
+                        "INSERT OR REPLACE INTO phone_names VALUES (?,?)",
+                        [phone, name],
+                    )
+                    changes += 1
+                else:
+                    # Remove name if cleared
+                    bills_con.execute(
+                        "DELETE FROM phone_names WHERE phone_number = ?",
+                        [phone],
+                    )
+
+            # Rebuild persons with new names
+            rebuild_dimensions(bills_con)
+            bills_con.execute("CHECKPOINT")
+            st.success(f"✅ Saved {changes} name(s) and rebuilt person mapping.")
+            st.rerun()
 

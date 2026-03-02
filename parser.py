@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS account_usage (
     total_messages       INTEGER,
     total_data_gb        DECIMAL(10,2)
 );
+CREATE TABLE IF NOT EXISTS phone_names (
+    phone_number  VARCHAR PRIMARY KEY,
+    person_name   VARCHAR NOT NULL
+);
 CREATE OR REPLACE VIEW person_monthly_cost AS
 SELECT
     p.person_id, p.person_label,
@@ -593,6 +597,17 @@ def rebuild_dimensions(con: duckdb.DuckDBPyConnection):
         GROUP BY phone_number
     """)
 
+    # Seed phone_names from PHONE_NAMES dict (only for phones not already in the table)
+    for phone, name in PHONE_NAMES.items():
+        con.execute(
+            "INSERT OR IGNORE INTO phone_names VALUES (?,?)", [phone, name]
+        )
+
+    # Build name lookup: DB overrides take priority, fallback to hardcoded
+    db_names = {}
+    for row in con.execute("SELECT phone_number, person_name FROM phone_names").fetchall():
+        db_names[row[0]] = row[1]
+
     # Person mapping
     con.execute("DELETE FROM persons")
     con.execute("DELETE FROM person_lines")
@@ -606,7 +621,7 @@ def rebuild_dimensions(con: duckdb.DuckDBPyConnection):
     for phone, ltype, first_dt, last_dt in rows:
         pid += 1
         rel = "voice" if ltype == "Voice" else ("wearable" if ltype == "Wearable" else "connected_device")
-        name = PHONE_NAMES.get(phone, phone)
+        name = db_names.get(phone, PHONE_NAMES.get(phone, phone))
         con.execute("INSERT INTO persons VALUES (?,?)", [pid, name])
         con.execute("INSERT INTO person_lines VALUES (?,?,?,?,?)",
                     [pid, phone, str(first_dt), None, rel])
