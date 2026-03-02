@@ -1366,7 +1366,7 @@ elif page == "Bill Splitup":
             height=min(800, 60 + 35 * len(bd)),
         )
 
-    # ── TAB 2: Per-Person Splitup ──────────────────────────────────
+    # ── TAB 2: Per-Person Splitup (Voice only) ───────────────────
     with tab2:
         st.subheader("Per-Person Splitup")
         if n_discounted > 0:
@@ -1374,38 +1374,30 @@ elif page == "Bill Splitup":
                 f"Account **${acct_total:,.2f}** = "
                 f"${_PLAN_PREMIUM:.0f} × {n_discounted} discounted line(s) "
                 f"+ **${remaining_pool:,.2f}** ÷ {n_voice} voice lines "
-                f"= **${equal_share:,.2f}**/line · "
-                f"MI & Wearable excluded"
+                f"= **${equal_share:,.2f}**/line"
             )
         else:
             st.caption(
                 f"Account charge **${acct_total:,.2f}** ÷ **{n_voice}** voice lines "
-                f"= **${equal_share:,.2f}** per voice line (MI & Wearable excluded)"
+                f"= **${equal_share:,.2f}** per voice line"
             )
 
-        sa = active.copy()
-        sa["_sort"] = sa["line_type"].map(_type_ord).fillna(3)
+        # Only Voice lines participate in splitup
+        sa = voice_active.copy()
         sa["Name"] = sa["phone_number"].map(name_map).fillna(sa["phone_number"])
-        sa = sa.sort_values(["_sort", "Name"]).reset_index(drop=True)
+        sa = sa.sort_values("Name").reset_index(drop=True)
 
         split_rows = []
-        voice_idx = 0
-        voice_count = len(sa[sa["line_type"] == "Voice"])
         for idx in range(len(sa)):
             r = sa.iloc[idx]
-            if r["line_type"] == "Voice":
-                voice_idx += 1
-                premium = _PLAN_PREMIUM if r["phone_number"] in discounted_phones else 0.0
-                acct_sh = premium + equal_share
-                # Add rounding remainder to last voice line
-                if voice_idx == voice_count:
-                    acct_sh += equal_remainder
-            else:
-                acct_sh = 0.0
+            premium = _PLAN_PREMIUM if r["phone_number"] in discounted_phones else 0.0
+            acct_sh = premium + equal_share
+            # Add rounding remainder to last voice line
+            if idx == len(sa) - 1:
+                acct_sh += equal_remainder
             split_rows.append({
                 "Name": r["Name"],
                 "Phone": r["phone_number"],
-                "Type": r["line_type"],
                 "Plan": float(r["plans_charge"]),
                 "Services": float(r["services_charge"]),
                 "Equipment": float(r["equipment_charge"]),
@@ -1416,8 +1408,13 @@ elif page == "Bill Splitup":
             })
 
         sp = pd.DataFrame(split_rows)
+
+        # MI / Wearable charges (excluded from split)
+        non_voice = active[active["line_type"] != "Voice"]
+        nv_total = float(non_voice["line_total"].sum()) if not non_voice.empty else 0.0
+
         t_sp = pd.DataFrame([{
-            "Name": "TOTAL", "Phone": "", "Type": "",
+            "Name": "TOTAL", "Phone": "",
             "Plan": sp["Plan"].sum(), "Services": sp["Services"].sum(),
             "Equipment": sp["Equipment"].sum(), "One-Time": sp["One-Time"].sum(),
             "Line Total": sp["Line Total"].sum(),
@@ -1433,12 +1430,7 @@ elif page == "Bill Splitup":
         def _style_sp(row):
             if row["Name"] == "TOTAL":
                 return ["font-weight:bold;background:#E20074;color:white"] * len(row)
-            base = ""
-            if row["Type"] == "Mobile Internet":
-                base = "background:#E3F2FD;"
-            elif row["Type"] == "Wearable":
-                base = "background:#FFF8E1;"
-            styles = [base] * len(row)
+            styles = [""] * len(row)
             cols = row.index.tolist()
             for cn, bg in [("Acct Share", "#FFF3CD"), ("Month Total", "#E8F5E9")]:
                 if cn in cols:
@@ -1451,16 +1443,29 @@ elif page == "Bill Splitup":
             height=min(800, 60 + 35 * len(sp_disp)),
         )
 
-        total_mt = float(sp_disp.iloc[-1]["Month Total"])
+        # Validation against invoice
+        voice_split_total = float(sp_disp.iloc[-1]["Month Total"])
         inv_total = float(inv_sel["total_due"])
-        if abs(total_mt - inv_total) < 0.02:
+        grand_total = voice_split_total + nv_total
+
+        if nv_total > 0:
+            st.info(
+                f"📱 Mobile Internet / Wearable charges: **${nv_total:,.2f}** "
+                f"(not included in per-person split)"
+            )
+
+        if abs(grand_total - inv_total) < 0.02:
             st.success(
-                f"✅ Splitup total **${total_mt:,.2f}** matches invoice **${inv_total:,.2f}**"
+                f"✅ Voice split **${voice_split_total:,.2f}** + "
+                f"MI/Wearable **${nv_total:,.2f}** = "
+                f"**${grand_total:,.2f}** matches invoice **${inv_total:,.2f}**"
             )
         else:
             st.warning(
-                f"⚠️ Splitup **${total_mt:,.2f}** vs invoice **${inv_total:,.2f}** "
-                f"(diff: ${total_mt - inv_total:+,.2f} — removed/cancelled lines excluded)"
+                f"⚠️ Voice split **${voice_split_total:,.2f}** + "
+                f"MI/Wearable **${nv_total:,.2f}** = **${grand_total:,.2f}** "
+                f"vs invoice **${inv_total:,.2f}** "
+                f"(diff: ${grand_total - inv_total:+,.2f} — removed/cancelled lines excluded)"
             )
 
     # ── TAB 3: Distribution ────────────────────────────────────────
