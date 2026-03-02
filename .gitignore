@@ -14,6 +14,7 @@ build/
 /*.duckdb
 *.duckdb.wal
 !data/tmobile_bills.duckdb
+!data/auth.duckdb
 
 # Excel exports
 *.xlsx
@@ -21,6 +22,9 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Streamlit secrets (contains credentials — NEVER commit)
+.streamlit/secrets.toml
 
 # OS
 Thumbs.db

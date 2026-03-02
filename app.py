@@ -4,7 +4,7 @@ Supports both local .duckdb seed and in-app PDF upload.
 Deployable on Streamlit Community Cloud.
 """
 
-import os, io, tempfile, shutil
+import sys, os, io, json, base64
 import streamlit as st
 import duckdb
 import pandas as pd
@@ -16,6 +16,29 @@ from parser import extract_bill, init_schema, load_bill_data, rebuild_dimensions
 # ─── Config ─────────────────────────────────────────────────────────
 
 SEED_DB = os.path.join(os.path.dirname(__file__), "data", "tmobile_bills.duckdb")
+AUTH_DB = os.path.join(os.path.dirname(__file__), "data", "auth.duckdb")
+
+def _motherduck_token() -> str:
+    """Return the MotherDuck token from secrets, or empty string if not set."""
+    try:
+        tok = st.secrets.get("motherduck", {}).get("token", "")
+        return tok if tok and "YOUR_" not in tok else ""
+    except Exception:
+        return ""
+
+def _is_motherduck() -> bool:
+    return bool(_motherduck_token())
+
+@st.cache_resource
+def _ensure_md_databases():
+    """Create MotherDuck databases if they don't exist (runs once per process)."""
+    tok = _motherduck_token()
+    if not tok:
+        return
+    con = duckdb.connect(f"md:?motherduck_token={tok}")
+    con.execute("CREATE DATABASE IF NOT EXISTS tmobile_bills")
+    con.execute("CREATE DATABASE IF NOT EXISTS tmobile_auth")
+    con.close()
 
 st.set_page_config(
     page_title="T-Mobile Bill Analytics",
@@ -24,24 +47,225 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# ─── Google OAuth Authentication ────────────────────────────────────
+
+def _google_auth_enabled() -> bool:
+    """Return True if Google OAuth secrets are configured with real values."""
+    try:
+        s = st.secrets.get("google_auth", {})
+        cid = s.get("client_id", "")
+        csec = s.get("client_secret", "")
+        # Skip if empty or still placeholder values
+        if not cid or not csec:
+            return False
+        if "YOUR_" in cid or "YOUR_" in csec:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _init_allowed_users_table(con):
+    """Create the allowed_users table if it doesn't exist."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            email       VARCHAR PRIMARY KEY,
+            name        VARCHAR,
+            role        VARCHAR DEFAULT 'viewer',
+            added_date  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+def _is_user_allowed(con, email: str) -> bool:
+    """Check if the email is in the allowed_users table."""
+    n = con.execute(
+        "SELECT COUNT(*) FROM allowed_users WHERE LOWER(email) = LOWER(?)", [email]
+    ).fetchone()[0]
+    return n > 0
+
+
+def _get_user_role(con, email: str) -> str:
+    """Return the role of the user ('admin' or 'viewer')."""
+    row = con.execute(
+        "SELECT role FROM allowed_users WHERE LOWER(email) = LOWER(?)", [email]
+    ).fetchone()
+    return row[0] if row else "viewer"
+
+
+def _get_allowed_user_count(con) -> int:
+    return con.execute("SELECT COUNT(*) FROM allowed_users").fetchone()[0]
+
+
+def login_gate():
+    """Google OAuth login gate with PKCE — blocks access until authenticated."""
+    if not _google_auth_enabled():
+        return
+
+    if st.session_state.get("authenticated"):
+        return
+
+    import urllib.parse, urllib.request, urllib.error
+
+    client_id = st.secrets["google_auth"]["client_id"]
+    client_secret = st.secrets["google_auth"]["client_secret"]
+    redirect_uri = st.secrets["google_auth"].get("redirect_uri", "http://localhost:8501")
+
+    # ── Handle OAuth callback ──────────────────────────────────────
+    qp = st.query_params
+    auth_code = qp.get("code")
+
+    if auth_code:
+        # Exchange authorization code for tokens (standard confidential-client flow, no PKCE)
+        token_data = urllib.parse.urlencode({
+            "code": auth_code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }).encode()
+
+        try:
+            req = urllib.request.Request(
+                "https://oauth2.googleapis.com/token",
+                data=token_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            resp = urllib.request.urlopen(req)
+            tokens = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode()
+            # If the code was already used (page refresh after login), show login button again
+            if "invalid_grant" in err_body:
+                st.query_params.clear()
+                st.rerun()
+            st.error(f"Token exchange failed: {err_body}")
+            st.stop()
+        except Exception as e:
+            st.error(f"Token exchange failed: {e}")
+            st.stop()
+
+        # Decode ID token to get user info (JWT payload)
+        id_token = tokens.get("id_token", "")
+        try:
+            payload = id_token.split(".")[1]
+            # Fix base64 padding
+            payload += "=" * (4 - len(payload) % 4)
+            user_info = json.loads(base64.urlsafe_b64decode(payload))
+        except Exception:
+            st.error("Failed to decode user info from Google.")
+            st.stop()
+
+        email = user_info.get("email", "")
+        name = user_info.get("name", email)
+
+        # Clear the ?code= from URL
+        st.query_params.clear()
+
+        # Check authorization
+        con = _get_auth_con()
+        _init_allowed_users_table(con)
+
+        # Ensure permanent admins always exist
+        _PERM_ADMINS = [
+            ("babuganesh2000@gmail.com", "Babu Ganesh"),
+            ("sathishnb4u@gmail.com", "Sathish NB"),
+        ]
+        for pa_email, pa_name in _PERM_ADMINS:
+            con.execute(
+                "INSERT OR IGNORE INTO allowed_users (email, name, role) VALUES (?, ?, 'admin')",
+                [pa_email, pa_name],
+            )
+            con.execute(
+                "UPDATE allowed_users SET role = 'admin' WHERE LOWER(email) = LOWER(?) AND role != 'admin'",
+                [pa_email],
+            )
+
+        if _is_user_allowed(con, email):
+            st.session_state["authenticated"] = True
+            st.session_state["user_email"] = email.lower()
+            st.session_state["display_name"] = name
+            st.session_state["user_role"] = _get_user_role(con, email)
+            st.rerun()
+        else:
+            st.markdown(
+                f"""
+                <div style="text-align:center; padding:3rem 0">
+                    <h1 style="color:#E20074">🚫 Access Denied</h1>
+                    <p style="font-size:1.1em">Signed in as <b>{email}</b></p>
+                    <p>Your email is not in the authorized users list.<br>
+                    Please contact the admin to request access.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Sign out"):
+                for k in ["authenticated", "user_email", "display_name", "user_role"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+            st.stop()
+    else:
+        # ── Show login screen with Google sign-in button ───────────
+        # Standard OAuth 2.0 auth code flow (no PKCE needed — we have client_secret)
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "access_type": "offline",
+            "prompt": "consent",
+        })
+
+        st.markdown(
+            f"""
+            <div style="text-align:center; padding:4rem 0">
+                <h1 style="color:#E20074">🔒 T-Mobile Bill Analytics</h1>
+                <p style="font-size:1.1em; margin-bottom:2rem">Sign in with your Google account to continue</p>
+                <a href="{auth_url}" style="
+                    display:inline-block; padding:0.75rem 2rem;
+                    background:#E20074; color:white; text-decoration:none;
+                    border-radius:8px; font-size:1.1em; font-weight:600;
+                ">🔑 Sign in with Google</a>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+
+def _get_auth_con():
+    """Get a DuckDB connection for auth — MotherDuck or local file."""
+    if "auth_con" not in st.session_state:
+        if _is_motherduck():
+            _ensure_md_databases()
+            con = duckdb.connect(f"md:tmobile_auth?motherduck_token={_motherduck_token()}")
+        else:
+            con = duckdb.connect(AUTH_DB)
+        _init_allowed_users_table(con)
+        st.session_state["auth_con"] = con
+    return st.session_state["auth_con"]
+
+
+# ── Run login gate ──────────────────────────────────────────────────
+login_gate()
+
+# If auth is enabled but user is NOT authenticated, stop here
+# (nothing — not even the sidebar — should render for unauthenticated visitors)
+if _google_auth_enabled() and not st.session_state.get("authenticated"):
+    st.stop()
+
 # ─── Session-level DB ───────────────────────────────────────────────
 
-def _get_db_path() -> str:
-    """Return the path to the session's writable DuckDB file."""
-    if "db_path" not in st.session_state:
-        tmp_dir = tempfile.mkdtemp(prefix="tmobile_")
-        tmp_db = os.path.join(tmp_dir, "bills.duckdb")
-        if os.path.exists(SEED_DB):
-            shutil.copy2(SEED_DB, tmp_db)
-        st.session_state["db_path"] = tmp_db
-    return st.session_state["db_path"]
-
-
 def get_con() -> duckdb.DuckDBPyConnection:
-    """Return the session's DuckDB connection (read-write)."""
+    """Return a DuckDB connection — MotherDuck (cloud) or local file."""
     if "db_con" not in st.session_state or st.session_state["db_con"] is None:
-        path = _get_db_path()
-        con = duckdb.connect(path)
+        if _is_motherduck():
+            _ensure_md_databases()
+            con = duckdb.connect(f"md:tmobile_bills?motherduck_token={_motherduck_token()}")
+        else:
+            os.makedirs(os.path.dirname(SEED_DB), exist_ok=True)
+            con = duckdb.connect(SEED_DB)
         init_schema(con)
         st.session_state["db_con"] = con
     return st.session_state["db_con"]
@@ -71,19 +295,38 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+# Show logged-in user & logout button
+if _google_auth_enabled() and st.session_state.get("authenticated"):
+    display = st.session_state.get("display_name", "")
+    email = st.session_state.get("user_email", "")
+    role = st.session_state.get("user_role", "viewer")
+    st.sidebar.markdown(f"👤 **{display}**")
+    st.sidebar.caption(f"{email} · {role}")
+    if st.sidebar.button("Sign out", use_container_width=True):
+        for key in ["authenticated", "user_email", "display_name", "user_role",
+                     "connected", "user_info", "oauth_id"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+    st.sidebar.divider()
+
+# Build nav list — add User Management for admins
+_nav_items = [
+    "Upload Bills",
+    "Overview",
+    "Monthly Trends",
+    "Line Analysis",
+    "Line Cost by Month",
+    "Usage Details",
+    "Person View",
+    "Savings & Discounts",
+    "Raw Data Explorer",
+]
+if st.session_state.get("user_role") == "admin":
+    _nav_items.append("User Management")
+
 page = st.sidebar.radio(
     "Navigate",
-    [
-        "Upload Bills",
-        "Overview",
-        "Monthly Trends",
-        "Line Analysis",
-        "Line Cost by Month",
-        "Usage Details",
-        "Person View",
-        "Savings & Discounts",
-        "Raw Data Explorer",
-    ],
+    _nav_items,
 )
 
 
@@ -93,51 +336,58 @@ page = st.sidebar.radio(
 
 if page == "Upload Bills":
     st.title("Upload T-Mobile Bill PDFs")
-    st.markdown(
-        "Upload one or more T-Mobile bill PDFs. They will be parsed and added "
-        "to the analytics database. Duplicate bills (same filename) are safely "
-        "replaced."
-    )
 
-    uploaded = st.file_uploader(
-        "Choose PDF files",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
+    _is_admin = st.session_state.get("user_role") == "admin"
 
-    if uploaded:
-        if st.button("Process Uploaded Bills", type="primary"):
-            con = get_con()
-            results = []
-            progress = st.progress(0, text="Processing...")
+    if _is_admin:
+        st.markdown(
+            "Upload one or more T-Mobile bill PDFs. They will be parsed and added "
+            "to the analytics database. Duplicate bills (same filename) are safely "
+            "replaced."
+        )
 
-            for i, f in enumerate(uploaded):
-                progress.progress((i + 1) / len(uploaded), text=f"Processing {f.name}...")
-                try:
-                    buf = io.BytesIO(f.read())
-                    data = extract_bill(buf, file_name=f.name)
-                    load_bill_data(con, data)
-                    inv = data["invoice"]
-                    results.append({
-                        "File": f.name,
-                        "Bill Date": inv["bill_date"],
-                        "Month": inv["bill_month"],
-                        "Total Due": f"${inv['total_due']:,.2f}",
-                        "Lines": len(data["lines"]),
-                        "Status": "Loaded",
-                    })
-                except Exception as e:
-                    results.append({
-                        "File": f.name, "Bill Date": "-", "Month": "-",
-                        "Total Due": "-", "Lines": 0, "Status": f"Error: {e}",
-                    })
+        uploaded = st.file_uploader(
+            "Choose PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
 
-            # Rebuild dimensions after all uploads
-            rebuild_dimensions(con)
-            progress.empty()
+        if uploaded:
+            if st.button("Process Uploaded Bills", type="primary"):
+                con = get_con()
+                results = []
+                progress = st.progress(0, text="Processing...")
 
-            st.success(f"Processed {len(uploaded)} file(s)")
-            st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+                for i, f in enumerate(uploaded):
+                    progress.progress((i + 1) / len(uploaded), text=f"Processing {f.name}...")
+                    try:
+                        buf = io.BytesIO(f.read())
+                        data = extract_bill(buf, file_name=f.name)
+                        load_bill_data(con, data)
+                        inv = data["invoice"]
+                        results.append({
+                            "File": f.name,
+                            "Bill Date": inv["bill_date"],
+                            "Month": inv["bill_month"],
+                            "Total Due": f"${inv['total_due']:,.2f}",
+                            "Lines": len(data["lines"]),
+                            "Status": "Loaded",
+                        })
+                    except Exception as e:
+                        results.append({
+                            "File": f.name, "Bill Date": "-", "Month": "-",
+                            "Total Due": "-", "Lines": 0, "Status": f"Error: {e}",
+                        })
+
+                # Rebuild dimensions after all uploads
+                rebuild_dimensions(con)
+                con.execute("CHECKPOINT")
+                progress.empty()
+
+                st.success(f"Processed {len(uploaded)} file(s)")
+                st.dataframe(pd.DataFrame(results), width="stretch", hide_index=True)
+    else:
+        st.info("Only **admin** users can upload bills. You have **viewer** access.")
 
     st.divider()
 
@@ -156,46 +406,49 @@ if page == "Upload Bills":
         n = run_query("SELECT COUNT(*) AS n FROM invoices").iloc[0, 0]
         st.caption(f"{n} bill(s) loaded")
 
-        st.divider()
-        st.subheader("Reset Database")
-        st.caption("Delete **all** loaded bills and start from scratch with an empty database.")
-        if st.button("Delete All Data & Reset", type="secondary"):
-            st.session_state["confirm_reset"] = True
+        if _is_admin:
+            st.divider()
+            st.subheader("Reset Database")
+            st.caption("Delete **all** loaded bills and start from scratch with an empty database.")
+            if st.button("Delete All Data & Reset", type="secondary"):
+                st.session_state["confirm_reset"] = True
 
-        if st.session_state.get("confirm_reset"):
-            st.warning("This will permanently delete every bill from the local database. Are you sure?")
-            c1, c2 = st.columns(2)
-            if c1.button("Yes, delete everything", type="primary"):
-                # Close existing connection
-                con = get_con()
-                con.close()
-                st.session_state["db_con"] = None
-                # Remove old DB file and create a fresh one
-                db_path = st.session_state["db_path"]
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-                new_con = duckdb.connect(db_path)
-                init_schema(new_con)
-                st.session_state["db_con"] = new_con
-                st.session_state.pop("confirm_reset", None)
-                st.success("Database reset to empty. Upload new PDFs to begin.")
-                st.rerun()
-            if c2.button("Cancel"):
-                st.session_state.pop("confirm_reset", None)
-                st.rerun()
+            if st.session_state.get("confirm_reset"):
+                st.warning("This will permanently delete every bill from the local database. Are you sure?")
+                c1, c2 = st.columns(2)
+                if c1.button("Yes, delete everything", type="primary"):
+                    # Truncate only transaction / dimension tables; keep allowed_users intact
+                    con = get_con()
+                    _TRANSACTION_TABLES = [
+                        "payments", "savings", "line_usage", "account_usage",
+                        "line_charges", "invoices",
+                        "person_lines", "persons", "lines",
+                    ]
+                    for tbl in _TRANSACTION_TABLES:
+                        try:
+                            con.execute(f"DELETE FROM {tbl}")
+                        except Exception:
+                            pass  # table may not exist yet
+                    con.execute("CHECKPOINT")
+                    st.session_state.pop("confirm_reset", None)
+                    st.success("Database reset to empty. Upload new PDFs to begin.")
+                    st.rerun()
+                if c2.button("Cancel"):
+                    st.session_state.pop("confirm_reset", None)
+                    st.rerun()
     else:
         st.info("No bills loaded yet. Upload PDFs above to get started.")
 
 
 # ─── Guard: remaining pages require data ────────────────────────────
 
-if page != "Upload Bills" and not has_data():
+if page not in ("Upload Bills", "User Management") and not has_data():
     st.warning("No data loaded. Go to **Upload Bills** to add PDFs first.")
     st.stop()
 
 # ─── Load dataframes (only when data exists) ────────────────────────
 
-if page != "Upload Bills":
+if page not in ("Upload Bills", "User Management") and has_data():
     invoices = run_query("SELECT * FROM invoices ORDER BY bill_date")
     line_charges = run_query("""
         SELECT lc.*, i.bill_month
@@ -1051,4 +1304,87 @@ elif page == "Raw Data Explorer":
     }
     for tbl, desc in tables_info.items():
         st.code(f"{tbl}  --  {desc}", language=None)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PAGE: User Management (admin only)
+# ════════════════════════════════════════════════════════════════════
+
+elif page == "User Management":
+    st.title("User Management")
+
+    if st.session_state.get("user_role") != "admin":
+        st.error("Admin access required.")
+        st.stop()
+
+    # Permanent admins — cannot be removed or demoted
+    PERMANENT_ADMINS = {"babuganesh2000@gmail.com", "sathishnb4u@gmail.com"}
+
+    auth_con = _get_auth_con()
+    _init_allowed_users_table(auth_con)
+
+    # ── Current Users ──────────────────────────────────────────────
+    st.subheader("Authorized Users")
+    users_df = auth_con.execute(
+        "SELECT email, name, role, added_date FROM allowed_users ORDER BY added_date"
+    ).fetchdf()
+
+    if users_df.empty:
+        st.info("No users in the list yet.")
+    else:
+        # Mark permanent admins visually
+        display_df = users_df.copy()
+        display_df["protected"] = display_df["email"].apply(
+            lambda e: "🔒 Permanent" if e.lower() in PERMANENT_ADMINS else ""
+        )
+        st.dataframe(display_df, width="stretch", hide_index=True)
+
+    st.divider()
+
+    # ── Add User ───────────────────────────────────────────────────
+    st.subheader("Add User")
+    st.caption("New users are always added as **viewer** (read-only). Only permanent admins have admin access.")
+    with st.form("add_user_form", clear_on_submit=True):
+        col1, col2 = st.columns([2, 2])
+        new_email = col1.text_input("Gmail / Google email", placeholder="user@gmail.com")
+        new_name = col2.text_input("Display name", placeholder="John Doe")
+        submitted = st.form_submit_button("Add User", type="primary")
+
+        if submitted:
+            if not new_email or "@" not in new_email:
+                st.error("Enter a valid email address.")
+            else:
+                try:
+                    auth_con.execute(
+                        "INSERT INTO allowed_users (email, name, role) VALUES (?, ?, 'viewer')",
+                        [new_email.lower().strip(), new_name.strip()],
+                    )
+                    st.success(f"✅ Added **{new_email}** as **viewer**")
+                    st.rerun()
+                except duckdb.ConstraintException:
+                    st.warning(f"**{new_email}** is already in the list.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.divider()
+
+    # ── Remove User ────────────────────────────────────────────────
+    st.subheader("Remove User")
+    if not users_df.empty:
+        # Exclude permanent admins and the current user from removal
+        removable = users_df[
+            ~users_df["email"].str.lower().isin(PERMANENT_ADMINS)
+            & (users_df["email"] != st.session_state.get("user_email", ""))
+        ]["email"].tolist()
+        if removable:
+            del_email = st.selectbox("Select user to remove", removable)
+            if st.button("Remove User", type="secondary"):
+                auth_con.execute(
+                    "DELETE FROM allowed_users WHERE LOWER(email) = LOWER(?)",
+                    [del_email],
+                )
+                st.success(f"Removed **{del_email}**")
+                st.rerun()
+        else:
+            st.info("No removable users. Permanent admins cannot be removed.")
 
