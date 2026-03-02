@@ -1286,11 +1286,20 @@ elif page == "Bill Splitup":
     active = indiv[~indiv["status"].isin(["removed", "cancelled"])]
     acct_total = float(acct_rows["line_total"].sum()) if not acct_rows.empty else 0.0
 
-    # Account share is split only among Voice lines (Mobile Internet & Wearable excluded)
+    # Account share: Voice lines only (Mobile Internet & Wearable excluded)
+    # Step 1: Lines with plans_charge < $10 get a $10 premium from account
+    # Step 2: Remaining account charges split equally among ALL voice lines
+    _PLAN_PREMIUM = 10.00
     voice_active = active[active["line_type"] == "Voice"]
     n_voice = len(voice_active)
-    share = round(acct_total / n_voice, 2) if n_voice > 0 else 0.0
-    remainder = round(acct_total - share * n_voice, 2)
+    discounted_phones = set(
+        voice_active[voice_active["plans_charge"] < _PLAN_PREMIUM]["phone_number"].tolist()
+    )
+    n_discounted = len(discounted_phones)
+    premium_pool = _PLAN_PREMIUM * n_discounted
+    remaining_pool = acct_total - premium_pool
+    equal_share = round(remaining_pool / n_voice, 2) if n_voice > 0 else 0.0
+    equal_remainder = round(remaining_pool - equal_share * n_voice, 2)
     n_active = len(active)
 
     name_map = (
@@ -1360,10 +1369,19 @@ elif page == "Bill Splitup":
     # ── TAB 2: Per-Person Splitup ──────────────────────────────────
     with tab2:
         st.subheader("Per-Person Splitup")
-        st.caption(
-            f"Account charge **${acct_total:,.2f}** ÷ **{n_voice}** voice lines "
-            f"= **${share:,.2f}** per voice line (Mobile Internet & Wearable excluded)"
-        )
+        if n_discounted > 0:
+            st.caption(
+                f"Account **${acct_total:,.2f}** = "
+                f"${_PLAN_PREMIUM:.0f} × {n_discounted} discounted line(s) "
+                f"+ **${remaining_pool:,.2f}** ÷ {n_voice} voice lines "
+                f"= **${equal_share:,.2f}**/line · "
+                f"MI & Wearable excluded"
+            )
+        else:
+            st.caption(
+                f"Account charge **${acct_total:,.2f}** ÷ **{n_voice}** voice lines "
+                f"= **${equal_share:,.2f}** per voice line (MI & Wearable excluded)"
+            )
 
         sa = active.copy()
         sa["_sort"] = sa["line_type"].map(_type_ord).fillna(3)
@@ -1377,7 +1395,11 @@ elif page == "Bill Splitup":
             r = sa.iloc[idx]
             if r["line_type"] == "Voice":
                 voice_idx += 1
-                acct_sh = share + (remainder if voice_idx == voice_count else 0)
+                premium = _PLAN_PREMIUM if r["phone_number"] in discounted_phones else 0.0
+                acct_sh = premium + equal_share
+                # Add rounding remainder to last voice line
+                if voice_idx == voice_count:
+                    acct_sh += equal_remainder
             else:
                 acct_sh = 0.0
             split_rows.append({
