@@ -69,8 +69,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     previous_balance       DECIMAL(10,2),
     voice_line_count       INTEGER,
     connected_device_count INTEGER,
-    wearable_count         INTEGER,
-    data_used_gb           DECIMAL(10,2)
+    wearable_count         INTEGER
 );
 CREATE TABLE IF NOT EXISTS line_charges (
     file_name         VARCHAR,
@@ -121,22 +120,6 @@ CREATE TABLE IF NOT EXISTS payments (
     description  VARCHAR,
     amount       DECIMAL(10,2)
 );
-CREATE TABLE IF NOT EXISTS line_usage (
-    file_name        VARCHAR,
-    bill_date        DATE,
-    phone_number     VARCHAR,
-    talk_minutes     INTEGER,
-    data_mb          DECIMAL(12,4),
-    data_gb          DECIMAL(10,2),
-    PRIMARY KEY (file_name, phone_number)
-);
-CREATE TABLE IF NOT EXISTS account_usage (
-    file_name            VARCHAR PRIMARY KEY,
-    bill_date            DATE,
-    total_talk_minutes   INTEGER,
-    total_messages       INTEGER,
-    total_data_gb        DECIMAL(10,2)
-);
 CREATE TABLE IF NOT EXISTS phone_names (
     phone_number  VARCHAR PRIMARY KEY,
     person_name   VARCHAR NOT NULL
@@ -164,169 +147,65 @@ SELECT
     SUM(line_total)       AS grand_total
 FROM person_monthly_cost
 GROUP BY person_id, person_label;
-CREATE OR REPLACE VIEW line_usage_monthly AS
-SELECT
-    lu.bill_date,
-    i.bill_month,
-    lu.phone_number,
-    l.line_type,
-    lu.talk_minutes,
-    lu.data_mb,
-    lu.data_gb,
-    lc.line_total
-FROM line_usage lu
-JOIN invoices i ON i.file_name = lu.file_name
-LEFT JOIN lines l ON l.phone_number = lu.phone_number
-LEFT JOIN line_charges lc ON lc.file_name = lu.file_name AND lc.phone_number = lu.phone_number;
-CREATE OR REPLACE VIEW usage_summary AS
-SELECT
-    au.bill_date,
-    i.bill_month,
-    au.total_talk_minutes,
-    au.total_messages,
-    au.total_data_gb,
-    i.total_due,
-    i.voice_line_count,
-    i.connected_device_count,
-    i.wearable_count
-FROM account_usage au
-JOIN invoices i ON i.file_name = au.file_name;
 """
 
 
-# ─── Usage detail extraction ────────────────────────────────────────
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-def _safe_extract_text(page, timeout=15):
-    """Extract text from a PDF page with a timeout to handle pdfminer hangs."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(page.extract_text)
-        try:
-            return future.result(timeout=timeout) or ""
-        except (FuturesTimeout, Exception):
-            return ""
+# ─── helpers: detailed-charges plan extraction ─────────────────────
 
-def extract_usage(pdf, bill_date: str, file_name: str) -> dict:
+def _extract_device_plan_charges(pdf, start_page: int = 1) -> dict:
     """
-    Extract per-line usage details from a T-Mobile bill PDF.
+    Scan the DETAILED CHARGES pages for CONNECTED DEVICES and WEARABLE
+    sections and return the *real* per-line plan charges.
 
-    Parses:
-      - Per-line data_gb from the "YOU USED" summary (pages 2-3)
-      - Per-line talk_minutes from USAGE DETAILS section totals
-      - Account-level total talk minutes, messages, and data GB
+    T-Mobile's summary table rolls taxes/fees into the 'Plans' column
+    for MI and Wearable lines (so Plans == Total, Services == 0).
+    The detailed section lists the actual plan charge before taxes.
 
-    Returns dict with:
-      - line_usage: list of {file_name, bill_date, phone_number, talk_minutes, data_mb, data_gb}
-      - account_usage: {file_name, bill_date, total_talk_minutes, total_messages, total_data_gb}
+    Returns  {phone_number: total_plan_charge}  (accumulated for mid-cycle).
     """
-    # 1) Parse "YOU USED" summary from pages 2-3
-    line_data_gb = {}
-    total_talk = 0
-    total_msgs = 0
-    total_data_gb = 0.0
+    real_plan: dict[str, float] = {}
+    section: str | None = None          # "mi" or "wearable" while inside those blocks
 
-    for i in [1, 2]:
-        if i >= len(pdf.pages):
-            break
-        text = _safe_extract_text(pdf.pages[i])
-        for m in re.finditer(r"\((\d{3})\)\s*(\d{3}-\d{4})\s+([\d.]+)GB", text):
-            phone = f"({m.group(1)}) {m.group(2)}"
-            line_data_gb[phone] = float(m.group(3))
-        for m in re.finditer(r"([\d,]+)\s+minutes\s+of\s+talk", text):
-            total_talk = int(m.group(1).replace(",", ""))
-        for m in re.finditer(r"([\d,]+)\s+messages", text):
-            total_msgs = int(m.group(1).replace(",", ""))
-        for m in re.finditer(r"([\d,.]+)\s*GB\s+of\s+data", text):
-            total_data_gb = float(m.group(1).replace(",", ""))
+    _SECTION_START = re.compile(
+        r"CONNECTED\s+DEVICE|(?<!\d\s)WEARABLE(?!\s+\$)", re.IGNORECASE)
+    _SECTION_RESET = re.compile(
+        r"TAXES|EQUIPMENT|HANDSETS|YOUR\sLAST\sBILL|"
+        r"THIS\sBILL\sSUMMARY|REGULAR\s+CHARGES|"
+        r"MID-CYCLE|VOICE\s+LINE", re.IGNORECASE)
+    _PHONE_CHARGE = re.compile(
+        r"(\(\d{3}\)\s*\d{3}-\d{4})\s+.+?\s+\$(\d+\.\d{2})")
 
-    # 2) Parse USAGE DETAILS pages for per-line talk_minutes and data_mb
-    line_usage_map = {}  # phone -> {talk_minutes, data_mb}
-    phone_sections = {}  # phone -> set of completed section types
-    active_phone_by_section = {}  # section_type -> phone
+    # Scan only the first 6 pages after start_page (detailed charges appear early)
+    end_page = min(start_page + 6, len(pdf.pages))
+    for pg in pdf.pages[start_page:end_page]:
+        text = pg.extract_text() or ""
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
 
-    for page_idx in range(4, len(pdf.pages)):
-        text = _safe_extract_text(pdf.pages[page_idx])
-        if not text:
-            continue
-        events = []
+            # Detect section boundaries
+            if _SECTION_RESET.search(stripped):
+                section = None
+            if "CONNECTED" in stripped and "DEVICE" in stripped:
+                section = "mi"
+                continue
+            if re.search(r"(?<!\d\s)WEARABLE", stripped) and "$" not in stripped.split("WEARABLE")[0]:
+                section = "wearable"
+                continue
 
-        for m in re.finditer(
-            r"\((\d{3})\)\s*(\d{3}-\d{4})\s+\w+ \d+\s*-\s*\w+ \d+", text
-        ):
-            phone = f"({m.group(1)}) {m.group(2)}"
-            events.append((m.start(), "header", phone, None))
+            if section not in ("mi", "wearable"):
+                continue
 
-        for m in re.finditer(
-            r"CONTINUED\s*-\s*\((\d{3})\)\s*(\d{3}-\d{4})\s*,\s*(\w+)", text
-        ):
-            phone = f"({m.group(1)}) {m.group(2)}"
-            section = m.group(3).upper()
-            events.append((m.start(), "continued", phone, section))
+            m = _PHONE_CHARGE.match(stripped)
+            if m:
+                phone = m.group(1)
+                charge = float(m.group(2))
+                real_plan[phone] = real_plan.get(phone, 0.0) + charge
 
-        for m in re.finditer(r"Totals\s+([\d,]+\.?\d*)\s+\$[\d,.]+", text):
-            val_str = m.group(1).replace(",", "")
-            events.append((m.start(), "totals_num", None, val_str))
-
-        events.sort(key=lambda x: x[0])
-
-        for _pos, etype, phone, val in events:
-            if etype == "header":
-                if phone not in line_usage_map:
-                    line_usage_map[phone] = {"talk_minutes": 0, "data_mb": 0.0}
-                if phone not in phone_sections:
-                    phone_sections[phone] = set()
-                active_phone_by_section["TALK"] = phone
-
-            elif etype == "continued":
-                if phone not in line_usage_map:
-                    line_usage_map[phone] = {"talk_minutes": 0, "data_mb": 0.0}
-                if phone not in phone_sections:
-                    phone_sections[phone] = set()
-                active_phone_by_section[val] = phone
-
-            elif etype == "totals_num":
-                val_f = float(val)
-                if "." in val and len(val.split(".")[1]) > 2:
-                    # Data MB (4+ decimal places)
-                    target = active_phone_by_section.get("DATA")
-                    if not target:
-                        for s in ["DATA", "TEXT", "TALK"]:
-                            if s in active_phone_by_section:
-                                target = active_phone_by_section[s]
-                                break
-                    if target and "data" not in phone_sections.get(target, set()):
-                        line_usage_map[target]["data_mb"] = val_f
-                        phone_sections.setdefault(target, set()).add("data")
-                else:
-                    # Talk minutes (integer)
-                    target = active_phone_by_section.get("TALK")
-                    if target and "talk" not in phone_sections.get(target, set()):
-                        line_usage_map[target]["talk_minutes"] = int(val_f)
-                        phone_sections.setdefault(target, set()).add("talk")
-
-    # Merge: prefer data_gb from summary (more reliable), fallback to data_mb
-    all_phones = set(line_data_gb.keys()) | set(line_usage_map.keys())
-    line_usage_list = []
-    for phone in sorted(all_phones):
-        talk_min = line_usage_map.get(phone, {}).get("talk_minutes", 0)
-        data_mb = line_usage_map.get(phone, {}).get("data_mb", 0.0)
-        data_gb = line_data_gb.get(phone, data_mb / 1024.0)
-        # If we have data_gb from summary but no data_mb, estimate
-        if data_gb > 0 and data_mb == 0:
-            data_mb = data_gb * 1024.0
-        line_usage_list.append(dict(
-            file_name=file_name, bill_date=bill_date, phone_number=phone,
-            talk_minutes=talk_min, data_mb=round(data_mb, 4), data_gb=data_gb,
-        ))
-
-    account_usage = dict(
-        file_name=file_name, bill_date=bill_date,
-        total_talk_minutes=total_talk, total_messages=total_msgs,
-        total_data_gb=total_data_gb,
-    )
-
-    return dict(line_usage=line_usage_list, account_usage=account_usage)
+    return real_plan
 
 
 # ─── PDF extraction ────────────────────────────────────────────────
@@ -384,8 +263,6 @@ def extract_bill(source, file_name: str | None = None) -> dict:
     if m:
         prev_balance = float(m.group(1).replace(",", ""))
 
-    data_gb = float(s1(r"([\d,]+\.?\d*)\s*GB\s+of\s+data", "0").replace(",", ""))
-
     invoice = dict(
         file_name=fname, account_number=account, bill_date=bill_date,
         bill_month=bill_month, due_date=due_date, total_due=total_due,
@@ -393,7 +270,7 @@ def extract_bill(source, file_name: str | None = None) -> dict:
         services_total=services_total, onetime_charges=onetime_total,
         total_savings=total_savings, previous_balance=prev_balance,
         voice_line_count=voice_lines, connected_device_count=connected_devices,
-        wearable_count=wearables, data_used_gb=data_gb,
+        wearable_count=wearables,
     )
 
     # ── line charges ─────────────────────────────────────────────────
@@ -477,6 +354,22 @@ def extract_bill(source, file_name: str | None = None) -> dict:
             line_total=_pm(tot_c),
         ))
 
+    # ── fix MI/Wearable plan charges ─────────────────────────────────
+    # Summary table bundles taxes/fees into the "Plans" column for
+    # Connected Devices and Wearable lines.  Extract the real plan
+    # charges from the DETAILED CHARGES section and move the
+    # tax portion into services_charge.
+    real_plan = _extract_device_plan_charges(pdf, start_page=1)
+    for entry in line_list:
+        if entry["line_type"] in ("Mobile Internet", "Wearable"):
+            phone = entry["phone_number"]
+            if phone in real_plan:
+                old_plans = entry["plans_charge"]
+                new_plans = round(real_plan[phone], 2)
+                if 0 < new_plans < old_plans:
+                    entry["services_charge"] = round(old_plans - new_plans, 2)
+                    entry["plans_charge"] = new_plans
+
     # ── savings ──────────────────────────────────────────────────────
     sav = []
     for label, pat in [
@@ -507,14 +400,10 @@ def extract_bill(source, file_name: str | None = None) -> dict:
             amount=_pm(m.group(3)),
         ))
 
-    # ── usage details (requires full PDF still open) ──────────────────
-    usage_data = extract_usage(pdf, bill_date, fname)
     pdf.close()
 
     return dict(
         invoice=invoice, lines=line_list, savings=sav, payments=pay,
-        line_usage=usage_data["line_usage"],
-        account_usage=usage_data["account_usage"],
     )
 
 
@@ -531,13 +420,13 @@ def init_schema(con: duckdb.DuckDBPyConnection):
 def load_bill_data(con: duckdb.DuckDBPyConnection, data: dict):
     """Insert parsed bill data into the DB."""
     inv = data["invoice"]
-    con.execute("INSERT OR REPLACE INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    con.execute("INSERT OR REPLACE INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [inv["file_name"], inv["account_number"], inv["bill_date"],
          inv["bill_month"], inv["due_date"], inv["total_due"],
          inv["plans_total"], inv["equipment_total"], inv["services_total"],
          inv["onetime_charges"], inv["total_savings"], inv["previous_balance"],
          inv["voice_line_count"], inv["connected_device_count"],
-         inv["wearable_count"], inv["data_used_gb"]])
+         inv["wearable_count"]])
 
     for r in data["lines"]:
         con.execute("INSERT OR REPLACE INTO line_charges VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -554,18 +443,6 @@ def load_bill_data(con: duckdb.DuckDBPyConnection, data: dict):
         con.execute("INSERT INTO payments VALUES (?,?,?,?,?)",
             [r["file_name"], r["bill_date"], r["entry_type"],
              r["description"], r["amount"]])
-
-    # Usage data
-    for r in data.get("line_usage", []):
-        con.execute("INSERT OR REPLACE INTO line_usage VALUES (?,?,?,?,?,?)",
-            [r["file_name"], r["bill_date"], r["phone_number"],
-             r["talk_minutes"], r["data_mb"], r["data_gb"]])
-
-    au = data.get("account_usage")
-    if au:
-        con.execute("INSERT OR REPLACE INTO account_usage VALUES (?,?,?,?,?)",
-            [au["file_name"], au["bill_date"], au["total_talk_minutes"],
-             au["total_messages"], au["total_data_gb"]])
 
 
 def rebuild_dimensions(con: duckdb.DuckDBPyConnection):

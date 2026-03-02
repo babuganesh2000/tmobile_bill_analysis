@@ -322,7 +322,7 @@ _nav_items += ["Upload Bills", "Overview", "Monthly Trends", "Bill Splitup"]
 
 # Analytics (secondary)
 _nav_items.append(f"{_SEPARATOR}📊  ANALYTICS")
-_nav_items += ["Line Analysis", "Line Cost by Month", "Usage Details", "Person View"]
+_nav_items += ["Line Analysis", "Line Cost by Month", "Person View"]
 
 # Reports
 _nav_items.append(f"{_SEPARATOR}📑  REPORTS")
@@ -455,7 +455,7 @@ if page == "Upload Bills":
                     # Truncate only transaction / dimension tables; keep allowed_users intact
                     con = get_con()
                     _TRANSACTION_TABLES = [
-                        "payments", "savings", "line_usage", "account_usage",
+                        "payments", "savings",
                         "line_charges", "invoices",
                         "person_lines", "persons", "lines",
                     ]
@@ -515,11 +515,6 @@ if page not in _SKIP_DATA_PAGES and has_data():
     """)
     person_monthly = run_query("SELECT * FROM person_monthly_cost ORDER BY person_id, bill_date")
     person_totals = run_query("SELECT * FROM person_total ORDER BY person_id")
-
-    # Usage tables
-    line_usage = run_query("SELECT * FROM line_usage_monthly ORDER BY bill_date, phone_number")
-    usage_summary = run_query("SELECT * FROM usage_summary ORDER BY bill_date")
-    account_usage = run_query("SELECT * FROM account_usage ORDER BY bill_date")
 
     invoices["label"] = invoices["bill_date"].apply(
         lambda d: d.strftime("%b %Y") if hasattr(d, "strftime") else str(d)[:7]
@@ -597,7 +592,7 @@ elif page == "Monthly Trends":
     metric = st.selectbox(
         "Select metric",
         ["total_due", "plans_total", "equipment_total", "services_total",
-         "onetime_charges", "total_savings", "data_used_gb"],
+         "onetime_charges", "total_savings"],
         format_func=lambda x: x.replace("_", " ").title(),
     )
 
@@ -930,253 +925,8 @@ elif page == "Line Cost by Month":
 
 
 # ════════════════════════════════════════════════════════════════════
-#  PAGE: Usage Details
+#  PAGE: Person View
 # ════════════════════════════════════════════════════════════════════
-
-elif page == "Usage Details":
-    st.title("Usage Details")
-
-    if line_usage.empty:
-        st.warning("No usage data found.  Re-upload bills to extract usage details.")
-    else:
-        # ── KPI cards ──────────────────────────────────
-        latest = usage_summary.iloc[-1] if not usage_summary.empty else None
-        k1, k2, k3, k4 = st.columns(4)
-        if latest is not None:
-            k1.metric("Latest Talk (min)", f"{int(latest['total_talk_minutes']):,}")
-            k2.metric("Latest Messages", f"{int(latest['total_messages']):,}")
-            k3.metric("Latest Data (GB)", f"{latest['total_data_gb']:.1f}")
-            k4.metric("Active Lines", f"{int(latest.get('voice_line_count', 0))}")
-
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Data Usage", "Talk Usage", "Account Trends", "Per-Line Drill-down"]
-        )
-
-        # ── TAB 1: Data Usage ──────────────────────────
-        with tab1:
-            st.subheader("Data Usage by Line (GB)")
-            data_pivot = line_usage.pivot_table(
-                index="phone_number", columns="bill_month",
-                values="data_gb", aggfunc="sum"
-            )
-            month_order = invoices["label"].tolist()
-            data_pivot = data_pivot.reindex(
-                columns=[m for m in month_order if m in data_pivot.columns]
-            )
-
-            fig_data = px.bar(
-                line_usage, x="bill_month", y="data_gb", color="phone_number",
-                title="Monthly Data Usage by Line",
-                labels={"bill_month": "Month", "data_gb": "GB", "phone_number": "Phone"},
-                category_orders={"bill_month": month_order},
-                color_discrete_sequence=px.colors.qualitative.Set2,
-            )
-            fig_data.update_layout(barmode="stack", xaxis_tickangle=-45)
-            st.plotly_chart(fig_data, use_container_width=True)
-
-            # Top data users
-            st.subheader("Top Data Users (All-Time)")
-            top_data = (
-                line_usage.groupby("phone_number")["data_gb"]
-                .sum()
-                .sort_values(ascending=True)
-                .reset_index()
-            )
-            fig_top_data = px.bar(
-                top_data, x="data_gb", y="phone_number", orientation="h",
-                title="Total Data (GB) by Phone",
-                labels={"data_gb": "Total GB", "phone_number": "Phone"},
-                color_discrete_sequence=["#E20074"],
-            )
-            st.plotly_chart(fig_top_data, use_container_width=True)
-
-            # Data heatmap
-            st.subheader("Data Heatmap (Phone x Month)")
-            fig_heat = px.imshow(
-                data_pivot.fillna(0).values,
-                x=data_pivot.columns.tolist(), y=data_pivot.index.tolist(),
-                color_continuous_scale="Magenta", aspect="auto",
-                labels=dict(x="Month", y="Phone", color="GB"),
-            )
-            fig_heat.update_layout(height=500)
-            st.plotly_chart(fig_heat, use_container_width=True)
-
-        # ── TAB 2: Talk Usage ──────────────────────────
-        with tab2:
-            st.subheader("Talk Minutes by Line")
-            talk_pivot = line_usage.pivot_table(
-                index="phone_number", columns="bill_month",
-                values="talk_minutes", aggfunc="sum"
-            )
-            talk_pivot = talk_pivot.reindex(
-                columns=[m for m in month_order if m in talk_pivot.columns]
-            )
-
-            fig_talk = px.bar(
-                line_usage, x="bill_month", y="talk_minutes", color="phone_number",
-                title="Monthly Talk Minutes by Line",
-                labels={"bill_month": "Month", "talk_minutes": "Minutes", "phone_number": "Phone"},
-                category_orders={"bill_month": month_order},
-                color_discrete_sequence=px.colors.qualitative.Set2,
-            )
-            fig_talk.update_layout(barmode="stack", xaxis_tickangle=-45)
-            st.plotly_chart(fig_talk, use_container_width=True)
-
-            # Top talkers
-            st.subheader("Top Talkers (All-Time)")
-            top_talk = (
-                line_usage.groupby("phone_number")["talk_minutes"]
-                .sum()
-                .sort_values(ascending=True)
-                .reset_index()
-            )
-            fig_top_talk = px.bar(
-                top_talk, x="talk_minutes", y="phone_number", orientation="h",
-                title="Total Talk Minutes by Phone",
-                labels={"talk_minutes": "Total Minutes", "phone_number": "Phone"},
-                color_discrete_sequence=["#E20074"],
-            )
-            st.plotly_chart(fig_top_talk, use_container_width=True)
-
-            # Talk heatmap
-            st.subheader("Talk Heatmap (Phone x Month)")
-            fig_theat = px.imshow(
-                talk_pivot.fillna(0).values,
-                x=talk_pivot.columns.tolist(), y=talk_pivot.index.tolist(),
-                color_continuous_scale="Magenta", aspect="auto",
-                labels=dict(x="Month", y="Phone", color="Minutes"),
-            )
-            fig_theat.update_layout(height=500)
-            st.plotly_chart(fig_theat, use_container_width=True)
-
-        # ── TAB 3: Account Trends ──────────────────────
-        with tab3:
-            st.subheader("Account-Level Usage Trends")
-            if not usage_summary.empty:
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_t = px.line(
-                        usage_summary, x="bill_month", y="total_talk_minutes",
-                        title="Total Talk Minutes per Month",
-                        labels={"bill_month": "Month", "total_talk_minutes": "Minutes"},
-                        markers=True,
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_t.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_t, use_container_width=True)
-
-                with col2:
-                    fig_d = px.line(
-                        usage_summary, x="bill_month", y="total_data_gb",
-                        title="Total Data (GB) per Month",
-                        labels={"bill_month": "Month", "total_data_gb": "GB"},
-                        markers=True,
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_d.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_d, use_container_width=True)
-
-                col3, col4 = st.columns(2)
-                with col3:
-                    fig_m = px.line(
-                        usage_summary, x="bill_month", y="total_messages",
-                        title="Total Messages per Month",
-                        labels={"bill_month": "Month", "total_messages": "Messages"},
-                        markers=True,
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_m.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_m, use_container_width=True)
-
-                with col4:
-                    # Cost vs Data scatter
-                    fig_cv = px.scatter(
-                        usage_summary, x="total_data_gb", y="total_due",
-                        title="Cost vs Data Usage",
-                        labels={"total_data_gb": "Data (GB)", "total_due": "Total Due ($)"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    st.plotly_chart(fig_cv, use_container_width=True)
-
-                # Usage per dollar
-                st.subheader("Efficiency Metrics")
-                eff = usage_summary.copy()
-                eff["gb_per_dollar"] = eff["total_data_gb"] / eff["total_due"].replace(0, float("nan"))
-                eff["min_per_dollar"] = eff["total_talk_minutes"] / eff["total_due"].replace(0, float("nan"))
-                e1, e2 = st.columns(2)
-                with e1:
-                    fig_gbd = px.bar(
-                        eff, x="bill_month", y="gb_per_dollar",
-                        title="GB per Dollar",
-                        labels={"bill_month": "Month", "gb_per_dollar": "GB/$"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_gbd.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_gbd, use_container_width=True)
-                with e2:
-                    fig_mpd = px.bar(
-                        eff, x="bill_month", y="min_per_dollar",
-                        title="Talk Minutes per Dollar",
-                        labels={"bill_month": "Month", "min_per_dollar": "Min/$"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_mpd.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_mpd, use_container_width=True)
-            else:
-                st.info("No account-level usage data available.")
-
-        # ── TAB 4: Per-Line Drill-down ─────────────────
-        with tab4:
-            st.subheader("Per-Line Usage History")
-            phones = sorted(line_usage["phone_number"].unique())
-            chosen = st.selectbox("Select Phone Number", phones)
-            lu_phone = line_usage[line_usage["phone_number"] == chosen].sort_values("bill_date")
-
-            if not lu_phone.empty:
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Avg Talk (min/mo)", f"{lu_phone['talk_minutes'].mean():.0f}")
-                m2.metric("Avg Data (GB/mo)", f"{lu_phone['data_gb'].mean():.1f}")
-                total_cost = lu_phone["line_total"].sum() if "line_total" in lu_phone.columns else 0
-                m3.metric("Total Charges", f"${total_cost:,.2f}")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    fig_pt = px.bar(
-                        lu_phone, x="bill_month", y="talk_minutes",
-                        title=f"Talk Minutes – {chosen}",
-                        labels={"bill_month": "Month", "talk_minutes": "Minutes"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_pt.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_pt, use_container_width=True)
-                with c2:
-                    fig_pd = px.bar(
-                        lu_phone, x="bill_month", y="data_gb",
-                        title=f"Data Usage – {chosen}",
-                        labels={"bill_month": "Month", "data_gb": "GB"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    fig_pd.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig_pd, use_container_width=True)
-
-                # Usage vs cost for this line
-                if "line_total" in lu_phone.columns:
-                    fig_uc = px.scatter(
-                        lu_phone, x="data_gb", y="line_total",
-                        title=f"Data vs Cost – {chosen}",
-                        labels={"data_gb": "Data (GB)", "line_total": "Charge ($)"},
-                        color_discrete_sequence=["#E20074"],
-                    )
-                    st.plotly_chart(fig_uc, use_container_width=True)
-
-                st.subheader("Raw Usage Data")
-                st.dataframe(
-                    lu_phone[["bill_month", "talk_minutes", "data_gb", "data_mb", "line_total"]].reset_index(drop=True),
-                    use_container_width=True, hide_index=True,
-                )
-            else:
-                st.info("No usage records for this phone number.")
-
 
 # ════════════════════════════════════════════════════════════════════
 #  PAGE: Person View
