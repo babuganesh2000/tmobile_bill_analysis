@@ -1285,9 +1285,13 @@ elif page == "Bill Splitup":
 
     active = indiv[~indiv["status"].isin(["removed", "cancelled"])]
     acct_total = float(acct_rows["line_total"].sum()) if not acct_rows.empty else 0.0
+
+    # Account share is split only among Voice lines (Mobile Internet & Wearable excluded)
+    voice_active = active[active["line_type"] == "Voice"]
+    n_voice = len(voice_active)
+    share = round(acct_total / n_voice, 2) if n_voice > 0 else 0.0
+    remainder = round(acct_total - share * n_voice, 2)
     n_active = len(active)
-    share = round(acct_total / n_active, 2) if n_active > 0 else 0.0
-    remainder = round(acct_total - share * n_active, 2)
 
     name_map = (
         persons.drop_duplicates("phone_number")
@@ -1357,8 +1361,8 @@ elif page == "Bill Splitup":
     with tab2:
         st.subheader("Per-Person Splitup")
         st.caption(
-            f"Account charge **${acct_total:,.2f}** ÷ **{n_active}** active lines "
-            f"= **${share:,.2f}** per line"
+            f"Account charge **${acct_total:,.2f}** ÷ **{n_voice}** voice lines "
+            f"= **${share:,.2f}** per voice line (Mobile Internet & Wearable excluded)"
         )
 
         sa = active.copy()
@@ -1367,9 +1371,15 @@ elif page == "Bill Splitup":
         sa = sa.sort_values(["_sort", "Name"]).reset_index(drop=True)
 
         split_rows = []
+        voice_idx = 0
+        voice_count = len(sa[sa["line_type"] == "Voice"])
         for idx in range(len(sa)):
             r = sa.iloc[idx]
-            acct_sh = share + (remainder if idx == len(sa) - 1 else 0)
+            if r["line_type"] == "Voice":
+                voice_idx += 1
+                acct_sh = share + (remainder if voice_idx == voice_count else 0)
+            else:
+                acct_sh = 0.0
             split_rows.append({
                 "Name": r["Name"],
                 "Phone": r["phone_number"],
