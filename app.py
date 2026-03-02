@@ -477,13 +477,15 @@ if page == "Upload Bills":
 
 # ─── Guard: remaining pages require data ────────────────────────────
 
-if page not in ("Upload Bills", "User Management") and not has_data():
+_SKIP_DATA_PAGES = ("Upload Bills", "User Management", "Phone Directory")
+
+if page not in _SKIP_DATA_PAGES and not has_data():
     st.warning("No data loaded. Go to **Upload Bills** to add PDFs first.")
     st.stop()
 
 # ─── Load dataframes (only when data exists) ────────────────────────
 
-if page not in ("Upload Bills", "User Management") and has_data():
+if page not in _SKIP_DATA_PAGES and has_data():
     invoices = run_query("SELECT * FROM invoices ORDER BY bill_date")
     line_charges = run_query("""
         SELECT lc.*, i.bill_month
@@ -529,7 +531,7 @@ if page not in ("Upload Bills", "User Management") and has_data():
 #  PAGE: Overview
 # ════════════════════════════════════════════════════════════════════
 
-elif page == "Overview":
+if page == "Overview":
     st.title("Account Overview")
 
     total_spent = float(invoices["total_due"].sum())
