@@ -33,6 +33,24 @@ def _pd(text: str) -> str:
     return text.strip()
 
 
+# ─── Phone-to-Name mapping ──────────────────────────────────────────
+
+PHONE_NAMES = {
+    "(501) 413-4884": "Sathish",
+    "(469) 328-8386": "Ganesh",
+    "(469) 859-9780": "Ramya",
+    "(501) 413-4892": "Sathya",
+    "(608) 622-3521": "Parthiban",
+    "(608) 609-3416": "Dharshana",
+    "(608) 770-2157": "Milan Kumar",
+    "(224) 770-0757": "Prince",
+    "(608) 207-8787": "Deepika",
+    "(224) 572-1750": "Sujitha",
+    "(501) 249-7415": "Mani",
+    "(331) 707-6438": "Meena",
+}
+
+
 # ─── DDL ────────────────────────────────────────────────────────────
 
 DDL = """
@@ -340,7 +358,11 @@ def extract_bill(source, file_name: str | None = None) -> dict:
     account   = s1(r"(\d{9,})")
     total_due = float(s1(r"TOTAL DUE\s*\n?\s*\$?([\d,]+\.\d{2})", "0").replace(",", ""))
     due_date  = _pd(s1(r"due by (\w+ \d{1,2}, \d{4})", bill_date))
-    bill_month = s1(r"Here.s your bill for (\w+)", "")
+    _bill_month_raw = s1(r"Here.s your bill for (\w+)", "")
+    try:
+        bill_month = datetime.strptime(bill_date, "%Y-%m-%d").strftime("%b %Y")
+    except ValueError:
+        bill_month = _bill_month_raw
 
     plans_total = float(s1(r"PLANS.*?=\s*\$?([\d,]+\.\d{2})", "0").replace(",", ""))
     eq_raw = s1(r"EQUIPMENT.*?=\s*(-?\$?[\d,]+\.\d{2})", "0")
@@ -584,6 +606,7 @@ def rebuild_dimensions(con: duckdb.DuckDBPyConnection):
     for phone, ltype, first_dt, last_dt in rows:
         pid += 1
         rel = "voice" if ltype == "Voice" else ("wearable" if ltype == "Wearable" else "connected_device")
-        con.execute("INSERT INTO persons VALUES (?,?)", [pid, f"Person {pid}"])
+        name = PHONE_NAMES.get(phone, phone)
+        con.execute("INSERT INTO persons VALUES (?,?)", [pid, name])
         con.execute("INSERT INTO person_lines VALUES (?,?,?,?,?)",
                     [pid, phone, str(first_dt), None, rel])

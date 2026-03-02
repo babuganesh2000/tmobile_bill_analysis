@@ -318,6 +318,7 @@ _nav_items = [
     "Line Cost by Month",
     "Usage Details",
     "Person View",
+    "Bill Splitup",
     "Savings & Discounts",
     "Raw Data Explorer",
 ]
@@ -1207,6 +1208,253 @@ elif page == "Person View":
             st.plotly_chart(fig2, width='stretch')
 
         st.dataframe(p_data, width='stretch', hide_index=True)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PAGE: Bill Splitup
+# ════════════════════════════════════════════════════════════════════
+
+elif page == "Bill Splitup":
+    st.title("Monthly Bill Splitup")
+
+    month_labels = invoices.sort_values("bill_date")["label"].tolist()
+    selected_label = st.selectbox(
+        "Select Billing Month", month_labels, index=len(month_labels) - 1
+    )
+
+    inv_sel = invoices[invoices["label"] == selected_label].iloc[0]
+    sel_date = inv_sel["bill_date"]
+
+    # ── Invoice summary ────────────────────────────────────────────
+    st.divider()
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Due", f"${float(inv_sel['total_due']):,.2f}")
+    k2.metric("Plans", f"${float(inv_sel['plans_total']):,.2f}")
+    k3.metric("Equipment", f"${float(inv_sel['equipment_total']):,.2f}")
+    k4.metric("Savings", f"${float(inv_sel['total_savings']):,.2f}")
+    k5.metric("Prev Balance", f"${float(inv_sel['previous_balance']):,.2f}")
+
+    _fmt_d = lambda d: d.strftime("%b %d, %Y") if hasattr(d, "strftime") else str(d)
+    st.caption(
+        f"📅 Bill Date: **{_fmt_d(sel_date)}** · Due: **{_fmt_d(inv_sel['due_date'])}** · "
+        f"Voice: **{inv_sel['voice_line_count']}** · "
+        f"Devices: **{inv_sel['connected_device_count']}** · "
+        f"Wearables: **{inv_sel['wearable_count']}**"
+    )
+
+    # ── Prepare data ───────────────────────────────────────────────
+    month_lc = line_charges[line_charges["bill_date"] == sel_date].copy()
+    acct_rows = month_lc[month_lc["phone_number"] == "Account"]
+    indiv = month_lc[month_lc["phone_number"] != "Account"].copy()
+
+    active = indiv[~indiv["status"].isin(["removed", "cancelled"])]
+    acct_total = float(acct_rows["line_total"].sum()) if not acct_rows.empty else 0.0
+    n_active = len(active)
+    share = round(acct_total / n_active, 2) if n_active > 0 else 0.0
+    remainder = round(acct_total - share * n_active, 2)
+
+    name_map = (
+        persons.drop_duplicates("phone_number")
+        .set_index("phone_number")["person_label"]
+        .to_dict()
+    )
+    indiv["Name"] = indiv["phone_number"].map(name_map).fillna(indiv["phone_number"])
+
+    _type_ord = {"Voice": 0, "Mobile Internet": 1, "Wearable": 2}
+
+    st.divider()
+    tab1, tab2, tab3 = st.tabs([
+        "📋 Bill Breakdown", "💰 Per-Person Splitup", "📊 Distribution"
+    ])
+
+    # ── TAB 1: Bill Breakdown ──────────────────────────────────────
+    with tab1:
+        st.subheader("T-Mobile Bill Breakdown")
+
+        bd = indiv.copy()
+        bd["_sort"] = bd["line_type"].map(_type_ord).fillna(3)
+        bd = bd.sort_values(["_sort", "Name"]).drop(columns="_sort")
+        bd = bd[["Name", "phone_number", "line_type", "status",
+                  "plans_charge", "equipment_charge", "services_charge",
+                  "onetime_charge", "line_total"]].copy()
+        bd.columns = ["Name", "Phone", "Type", "Status",
+                       "Plans", "Equipment", "Services", "One-Time", "Total"]
+
+        acct_r = pd.DataFrame([{
+            "Name": "Account", "Phone": "", "Type": "Account", "Status": "",
+            "Plans": float(acct_rows["plans_charge"].sum()) if not acct_rows.empty else 0,
+            "Equipment": float(acct_rows["equipment_charge"].sum()) if not acct_rows.empty else 0,
+            "Services": float(acct_rows["services_charge"].sum()) if not acct_rows.empty else 0,
+            "One-Time": float(acct_rows["onetime_charge"].sum()) if not acct_rows.empty else 0,
+            "Total": acct_total,
+        }])
+        bd = pd.concat([bd, acct_r], ignore_index=True)
+
+        t_row = pd.DataFrame([{
+            "Name": "TOTAL", "Phone": "", "Type": "", "Status": "",
+            "Plans": bd["Plans"].sum(), "Equipment": bd["Equipment"].sum(),
+            "Services": bd["Services"].sum(), "One-Time": bd["One-Time"].sum(),
+            "Total": bd["Total"].sum(),
+        }])
+        bd = pd.concat([bd, t_row], ignore_index=True)
+
+        def _style_bd(row):
+            if row["Name"] == "TOTAL":
+                return ["font-weight:bold;background:#E20074;color:white"] * len(row)
+            if row["Name"] == "Account":
+                return ["font-weight:bold;background:#FFF3CD"] * len(row)
+            if row["Status"] == "removed":
+                return ["color:#999;font-style:italic"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            bd.style
+            .format({"Plans": "${:,.2f}", "Equipment": "${:,.2f}",
+                      "Services": "${:,.2f}", "One-Time": "${:,.2f}",
+                      "Total": "${:,.2f}"})
+            .apply(_style_bd, axis=1),
+            use_container_width=True, hide_index=True,
+            height=min(800, 60 + 35 * len(bd)),
+        )
+
+    # ── TAB 2: Per-Person Splitup ──────────────────────────────────
+    with tab2:
+        st.subheader("Per-Person Splitup")
+        st.caption(
+            f"Account charge **${acct_total:,.2f}** ÷ **{n_active}** active lines "
+            f"= **${share:,.2f}** per line"
+        )
+
+        sa = active.copy()
+        sa["_sort"] = sa["line_type"].map(_type_ord).fillna(3)
+        sa["Name"] = sa["phone_number"].map(name_map).fillna(sa["phone_number"])
+        sa = sa.sort_values(["_sort", "Name"]).reset_index(drop=True)
+
+        split_rows = []
+        for idx in range(len(sa)):
+            r = sa.iloc[idx]
+            acct_sh = share + (remainder if idx == len(sa) - 1 else 0)
+            split_rows.append({
+                "Name": r["Name"],
+                "Phone": r["phone_number"],
+                "Type": r["line_type"],
+                "Plan": float(r["plans_charge"]),
+                "Services": float(r["services_charge"]),
+                "Equipment": float(r["equipment_charge"]),
+                "One-Time": float(r["onetime_charge"]),
+                "Line Total": float(r["line_total"]),
+                "Acct Share": round(acct_sh, 2),
+                "Month Total": round(float(r["line_total"]) + acct_sh, 2),
+            })
+
+        sp = pd.DataFrame(split_rows)
+        t_sp = pd.DataFrame([{
+            "Name": "TOTAL", "Phone": "", "Type": "",
+            "Plan": sp["Plan"].sum(), "Services": sp["Services"].sum(),
+            "Equipment": sp["Equipment"].sum(), "One-Time": sp["One-Time"].sum(),
+            "Line Total": sp["Line Total"].sum(),
+            "Acct Share": sp["Acct Share"].sum(),
+            "Month Total": sp["Month Total"].sum(),
+        }])
+        sp_disp = pd.concat([sp, t_sp], ignore_index=True)
+
+        money = {c: "${:,.2f}" for c in
+                 ["Plan", "Services", "Equipment", "One-Time",
+                  "Line Total", "Acct Share", "Month Total"]}
+
+        def _style_sp(row):
+            if row["Name"] == "TOTAL":
+                return ["font-weight:bold;background:#E20074;color:white"] * len(row)
+            base = ""
+            if row["Type"] == "Mobile Internet":
+                base = "background:#E3F2FD;"
+            elif row["Type"] == "Wearable":
+                base = "background:#FFF8E1;"
+            styles = [base] * len(row)
+            cols = row.index.tolist()
+            for cn, bg in [("Acct Share", "#FFF3CD"), ("Month Total", "#E8F5E9")]:
+                if cn in cols:
+                    styles[cols.index(cn)] = f"background:{bg};font-weight:bold;"
+            return styles
+
+        st.dataframe(
+            sp_disp.style.format(money).apply(_style_sp, axis=1),
+            use_container_width=True, hide_index=True,
+            height=min(800, 60 + 35 * len(sp_disp)),
+        )
+
+        total_mt = float(sp_disp.iloc[-1]["Month Total"])
+        inv_total = float(inv_sel["total_due"])
+        if abs(total_mt - inv_total) < 0.02:
+            st.success(
+                f"✅ Splitup total **${total_mt:,.2f}** matches invoice **${inv_total:,.2f}**"
+            )
+        else:
+            st.warning(
+                f"⚠️ Splitup **${total_mt:,.2f}** vs invoice **${inv_total:,.2f}** "
+                f"(diff: ${total_mt - inv_total:+,.2f} — removed/cancelled lines excluded)"
+            )
+
+    # ── TAB 3: Distribution ────────────────────────────────────────
+    with tab3:
+        st.subheader("Cost Distribution")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            voice_sp = sp[sp["Type"] == "Voice"]
+            if not voice_sp.empty:
+                fig_pie1 = px.pie(
+                    voice_sp, names="Name", values="Month Total",
+                    title=f"Voice Line Cost Share — {selected_label}",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    hole=0.3,
+                )
+                fig_pie1.update_traces(
+                    textinfo="label+value+percent",
+                    texttemplate="%{label}<br>$%{value:,.2f}<br>(%{percent})",
+                )
+                st.plotly_chart(fig_pie1, use_container_width=True)
+
+        with col2:
+            cats = {
+                "Plans": float(active["plans_charge"].sum()),
+                "Equipment": float(active["equipment_charge"].sum()),
+                "Services": float(active["services_charge"].sum()),
+                "One-Time": float(active["onetime_charge"].sum()),
+                "Account": acct_total,
+            }
+            cats = {k: v for k, v in cats.items() if v != 0}
+            if cats:
+                fig_pie2 = px.pie(
+                    names=list(cats.keys()), values=list(cats.values()),
+                    title=f"Charge Category Mix — {selected_label}",
+                    color_discrete_sequence=["#E20074", "#5C2D91", "#0078D4",
+                                              "#FFB900", "#107C10"],
+                    hole=0.3,
+                )
+                fig_pie2.update_traces(
+                    textinfo="label+value+percent",
+                    texttemplate="%{label}<br>$%{value:,.2f}<br>(%{percent})",
+                )
+                st.plotly_chart(fig_pie2, use_container_width=True)
+
+        bar_df = sp.sort_values("Month Total", ascending=True)
+        fig_bar = go.Figure()
+        fig_bar.add_trace(go.Bar(
+            y=bar_df["Name"], x=bar_df["Line Total"],
+            name="Line Charges", orientation="h", marker_color="#E20074",
+        ))
+        fig_bar.add_trace(go.Bar(
+            y=bar_df["Name"], x=bar_df["Acct Share"],
+            name="Account Share", orientation="h", marker_color="#FFB900",
+        ))
+        fig_bar.update_layout(
+            barmode="stack",
+            title=f"Per-Person: Line Charges + Account Share — {selected_label}",
+            xaxis_title="Amount ($)", yaxis_title="",
+            height=max(400, 40 * len(bar_df) + 100),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════
