@@ -1474,10 +1474,9 @@ elif page == "Bill Splitup":
         col1, col2 = st.columns(2)
 
         with col1:
-            voice_sp = sp[sp["Type"] == "Voice"]
-            if not voice_sp.empty:
+            if not sp.empty:
                 fig_pie1 = px.pie(
-                    voice_sp, names="Name", values="Month Total",
+                    sp, names="Name", values="Month Total",
                     title=f"Voice Line Cost Share — {selected_label}",
                     color_discrete_sequence=px.colors.qualitative.Set2,
                     hole=0.3,
