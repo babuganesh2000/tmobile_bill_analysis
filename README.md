@@ -1,16 +1,50 @@
 # T-Mobile Bill Analytics Dashboard
 
-A Streamlit-powered analytics dashboard for T-Mobile monthly bills. Upload PDF bills and explore spending trends, per-line charges, savings, and more.
+A Streamlit-powered analytics dashboard for T-Mobile monthly bills. Upload PDF bills and explore spending trends, per-line charges, savings, and more — with Google OAuth authentication and cloud-hosted MotherDuck database.
+
+## Screenshots
+
+### Login
+Secure Google OAuth sign-in — only authorized users can access the dashboard.
+
+![Login](screenshots/01_login.png)
+
+### Upload Bills
+Upload T-Mobile PDF bills. Parsed data is stored in MotherDuck (cloud) or local DuckDB.
+
+![Upload Bills](screenshots/02_upload.png)
+
+### Account Overview
+KPIs at a glance: total spent, average bill, savings, active lines, and monthly trend chart.
+
+![Overview](screenshots/03_overview.png)
+
+### User Management (Admin)
+Manage authorized users — add viewers, remove access, permanent admin protection.
+
+![User Management](screenshots/04_user_management.png)
 
 ## Features
 
-- **PDF Upload** — Upload monthly T-Mobile bill PDFs directly in the app
-- **Account Overview** — KPIs, bill composition, and line counts
+### 📋 Core
+- **Upload Bills** — Upload monthly T-Mobile bill PDFs directly in the app
+- **Account Overview** — KPIs, bill composition, line counts, and monthly bar chart
 - **Monthly Trends** — Track any metric over time with MoM change
+- **Bill Splitup** — Per-person monthly cost breakdown with account charge distribution (Voice lines only)
+
+### 📊 Analytics
 - **Line Analysis** — Per-line lifecycle, charge breakdown, and heatmap
+- **Line Cost by Month** — Filterable month-over-month cost per phone line
+- **Usage Details** — Talk minutes, data usage per line
 - **Person View** — Aggregated cost per person across all lines
+
+### 📑 Reports
 - **Savings & Discounts** — AutoPay, service, and device discount tracking
 - **Raw Data Explorer** — Run arbitrary SQL against the DuckDB database
+
+### ⚙️ Admin
+- **User Management** — Google OAuth user access control with admin/viewer roles
+- **Phone Directory** — Map phone numbers to person names via UI
 
 ## Quick Start (Local)
 
@@ -42,15 +76,22 @@ The app ships with a pre-loaded seed database (`data/tmobile_bills.duckdb`) so t
 ## Project Structure
 
 ```
-├── app.py                  # Streamlit dashboard (main entry point)
-├── parser.py               # Shared PDF parser & DuckDB loader module
-├── load_bills.py           # CLI tool for batch-loading PDFs
-├── export_xlsx.py          # Export DB to formatted Excel workbook
+├── app.py                    # Streamlit dashboard (main entry point)
+├── parser.py                 # Shared PDF parser & DuckDB loader module
+├── load_bills.py             # CLI tool for batch-loading PDFs
+├── export_xlsx.py            # Export DB to formatted Excel workbook
+├── redact_screenshots.py     # Blur/grey personal info in screenshots
 ├── data/
-│   └── tmobile_bills.duckdb  # Seed database (pre-loaded)
+│   └── tmobile_bills.duckdb  # Seed database (empty for cloud deploy)
+├── screenshots/              # App screenshots (redacted)
+│   ├── 01_login.png
+│   ├── 02_upload.png
+│   ├── 03_overview.png
+│   └── 04_user_management.png
 ├── requirements.txt
 ├── .streamlit/
-│   └── config.toml         # Theme & server config
+│   ├── config.toml           # Theme & server config
+│   └── secrets.toml          # Google OAuth + MotherDuck token (gitignored)
 └── README.md
 ```
 
@@ -58,9 +99,10 @@ The app ships with a pre-loaded seed database (`data/tmobile_bills.duckdb`) so t
 
 - **Streamlit** — Web UI
 - **Plotly** — Interactive charts
-- **DuckDB** — Embedded analytical database
+- **DuckDB + MotherDuck** — Embedded / cloud analytical database
 - **pdfplumber** — PDF text extraction
 - **Pandas** — Data manipulation
+- **Google OAuth 2.0** — Authentication
 
 ## CLI Usage
 
