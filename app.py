@@ -521,6 +521,75 @@ if page not in _SKIP_DATA_PAGES and has_data():
     )
     num_months = len(invoices)
 
+    # ── Universal account-share helper ─────────────────────────────
+    _PLAN_PREMIUM = 10.00
+
+    def _compute_acct_shares(lc_month: pd.DataFrame) -> dict:
+        """Return {phone_number: acct_share} for one billing month.
+
+        Rules (same as Bill Splitup):
+        - Account share goes to Voice lines only; MI & Wearable get $0.
+        - Discounted voice lines (plans_charge < $10) pay a $10 premium
+          from the account pool first.
+        - Remaining account pool is split equally among all voice lines.
+        """
+        acct_rows = lc_month[lc_month["phone_number"] == "Account"]
+        indiv = lc_month[lc_month["phone_number"] != "Account"]
+        active = indiv[~indiv["status"].isin(["removed", "cancelled"])]
+        acct_total = float(acct_rows["line_total"].sum()) if not acct_rows.empty else 0.0
+
+        voice_active = active[active["line_type"] == "Voice"]
+        n_voice = len(voice_active)
+        discounted_phones = set(
+            voice_active[voice_active["plans_charge"] < _PLAN_PREMIUM]["phone_number"].tolist()
+        )
+        n_discounted = len(discounted_phones)
+        premium_pool = _PLAN_PREMIUM * n_discounted
+        remaining_pool = acct_total - premium_pool
+        equal_share = round(remaining_pool / n_voice, 2) if n_voice > 0 else 0.0
+        equal_remainder = round(remaining_pool - equal_share * n_voice, 2)
+
+        shares = {}
+        voice_idx = 0
+        for phone in active["phone_number"].tolist():
+            lt = active.loc[active["phone_number"] == phone, "line_type"].iloc[0]
+            if lt == "Voice":
+                voice_idx += 1
+                premium = _PLAN_PREMIUM if phone in discounted_phones else 0.0
+                sh = premium + equal_share
+                if voice_idx == n_voice:
+                    sh += equal_remainder
+                shares[phone] = round(sh, 2)
+            else:
+                shares[phone] = 0.0
+        return shares
+
+    def _build_month_splitup(lc_month: pd.DataFrame) -> pd.DataFrame:
+        """Build per-line splitup for one month with account share + taxes."""
+        shares = _compute_acct_shares(lc_month)
+        indiv = lc_month[lc_month["phone_number"] != "Account"]
+        active = indiv[~indiv["status"].isin(["removed", "cancelled"])]
+        rows = []
+        for _, r in active.iterrows():
+            phone = r["phone_number"]
+            plan = float(r["plans_charge"])
+            equip = float(r["equipment_charge"])
+            svc = float(r["services_charge"])
+            ot = float(r["onetime_charge"])
+            total = float(r["line_total"])
+            taxes = round(total - plan - equip - svc - ot, 2)
+            acct_sh = shares.get(phone, 0.0)
+            rows.append({
+                "phone_number": phone,
+                "line_type": r["line_type"],
+                "status": r["status"],
+                "plan": plan, "equipment": equip, "services": svc,
+                "onetime": ot, "taxes_fees": taxes,
+                "line_total": total, "acct_share": acct_sh,
+                "month_total": round(total + acct_sh, 2),
+            })
+        return pd.DataFrame(rows)
+
 
 # ════════════════════════════════════════════════════════════════════
 #  PAGE: Overview
@@ -721,7 +790,7 @@ elif page == "Line Analysis":
 elif page == "Line Cost by Month":
     st.title("Line Cost by Month")
 
-    # ── Separate line-level vs account-level charges ───────────────
+    # ── Prepare data ───────────────────────────────────────────────
     all_cost = line_charges.copy()
     all_cost["bill_date"] = pd.to_datetime(all_cost["bill_date"])
     all_cost["month"] = all_cost["bill_date"].apply(
@@ -730,12 +799,25 @@ elif page == "Line Cost by Month":
     all_months_sorted = invoices.sort_values("bill_date")["label"].tolist()
 
     line_data = all_cost[all_cost["phone_number"] != "Account"].copy()
-    acct_data = all_cost[all_cost["phone_number"] == "Account"].copy()
 
-    # Per-month: account charge & number of active lines
-    acct_per_month = acct_data.groupby("month")["line_total"].sum()
-    lines_per_month = line_data.groupby("month")["phone_number"].nunique()
-    share_per_month = (acct_per_month / lines_per_month).fillna(0)  # per-line account share
+    # ── Build per-line per-month splitup using universal helper ────
+    splitup_rows = []
+    for bill_date in line_charges["bill_date"].unique():
+        lc_m = line_charges[line_charges["bill_date"] == bill_date]
+        sp = _build_month_splitup(lc_m)
+        month_label = pd.Timestamp(bill_date).strftime("%b %Y")
+        sp["month"] = month_label
+        sp["bill_date"] = bill_date
+        splitup_rows.append(sp)
+    all_splitup = pd.concat(splitup_rows, ignore_index=True) if splitup_rows else pd.DataFrame()
+
+    # Name map
+    _name_map = (
+        persons.drop_duplicates("phone_number")
+        .set_index("phone_number")["person_label"].to_dict()
+    )
+    if not all_splitup.empty:
+        all_splitup["name"] = all_splitup["phone_number"].map(_name_map).fillna(all_splitup["phone_number"])
 
     # ── Filters ────────────────────────────────────────────────────
     st.markdown("##### Filters")
@@ -776,10 +858,9 @@ elif page == "Line Cost by Month":
         sel_type = st.selectbox("Line type", line_types, index=0)
 
     # Apply filters
-    filtered = line_data[line_data["month"].isin(cutoff_months)].copy()
+    filtered = all_splitup[all_splitup["month"].isin(cutoff_months)].copy()
     if sel_type != "All lines":
-        type_phones = lines_dim[lines_dim["line_type"] == sel_type]["phone_number"].tolist()
-        filtered = filtered[filtered["phone_number"].isin(type_phones)]
+        filtered = filtered[filtered["line_type"] == sel_type]
 
     if filtered.empty:
         st.warning("No data for the selected filters.")
@@ -787,125 +868,156 @@ elif page == "Line Cost by Month":
 
     month_order = [m for m in all_months_sorted if m in cutoff_months]
 
-    # ── Build line-charge pivot ────────────────────────────────────
-    line_pivot = filtered.pivot_table(index="phone_number", columns="month",
-                                       values="line_total", aggfunc="sum")
-    line_pivot = line_pivot.reindex(columns=[m for m in month_order if m in line_pivot.columns])
+    # ── Build pivots ───────────────────────────────────────────────
+    # Month Total pivot (line charge + taxes + acct share)
+    mt_pivot = filtered.pivot_table(index="phone_number", columns="month",
+                                     values="month_total", aggfunc="sum")
+    mt_pivot = mt_pivot.reindex(columns=[m for m in month_order if m in mt_pivot.columns])
 
-    # ── Build account-share pivot (same shape, each cell = share) ──
-    acct_share_pivot = line_pivot.copy()
-    for m in acct_share_pivot.columns:
-        # Only assign share where the line was active (has a charge)
-        acct_share_pivot[m] = acct_share_pivot[m].apply(
-            lambda v: round(share_per_month.get(m, 0), 2) if pd.notna(v) else None
-        )
+    # Line charge pivot (plan + equip + svc + onetime + taxes, no acct share)
+    lt_pivot = filtered.pivot_table(index="phone_number", columns="month",
+                                     values="line_total", aggfunc="sum")
+    lt_pivot = lt_pivot.reindex(columns=[m for m in month_order if m in lt_pivot.columns])
 
-    # ── Combined pivot (line charge + account share) ───────────────
-    combined_pivot = line_pivot.fillna(0) + acct_share_pivot.fillna(0)
-    # Restore NaN where line wasn't active
-    combined_pivot[line_pivot.isna()] = None
+    # Taxes pivot
+    tax_pivot = filtered.pivot_table(index="phone_number", columns="month",
+                                      values="taxes_fees", aggfunc="sum")
+    tax_pivot = tax_pivot.reindex(columns=[m for m in month_order if m in tax_pivot.columns])
 
-    # Add summary columns
-    for pv, prefix in [(line_pivot, "Line"), (acct_share_pivot, "Acct Share"), (combined_pivot, "Total Due")]:
-        pv[prefix + " TOTAL"] = pv[month_order].sum(axis=1, min_count=1)
+    # Acct share pivot
+    as_pivot = filtered.pivot_table(index="phone_number", columns="month",
+                                     values="acct_share", aggfunc="sum")
+    as_pivot = as_pivot.reindex(columns=[m for m in month_order if m in as_pivot.columns])
 
-    # Add TOTAL row to combined
-    totals_row = combined_pivot.sum()
-    totals_row.name = "TOTAL"
-    combined_pivot_display = pd.concat([combined_pivot, totals_row.to_frame().T])
+    # Summary columns
+    mt_pivot["Month Total TOTAL"] = mt_pivot[[m for m in month_order if m in mt_pivot.columns]].sum(axis=1, min_count=1)
+    lt_pivot["Line TOTAL"] = lt_pivot[[m for m in month_order if m in lt_pivot.columns]].sum(axis=1, min_count=1)
+    tax_pivot["Taxes TOTAL"] = tax_pivot[[m for m in month_order if m in tax_pivot.columns]].sum(axis=1, min_count=1)
+    as_pivot["Acct Share TOTAL"] = as_pivot[[m for m in month_order if m in as_pivot.columns]].sum(axis=1, min_count=1)
 
     n_months = len(month_order)
-    n_lines = len(line_pivot)
+    n_lines = len(mt_pivot)
 
     # ── KPIs ───────────────────────────────────────────────────────
-    grand_total = combined_pivot_display.loc["TOTAL", "Total Due TOTAL"]
-    acct_total_period = float(acct_share_pivot["Acct Share TOTAL"].sum())
-    line_total_period = float(line_pivot["Line TOTAL"].sum())
-    share_example = share_per_month.get(month_order[-1], 0) if month_order else 0
+    grand_total = float(mt_pivot["Month Total TOTAL"].sum())
+    line_total_period = float(lt_pivot["Line TOTAL"].sum())
+    taxes_total_period = float(tax_pivot["Taxes TOTAL"].sum())
+    acct_total_period = float(as_pivot["Acct Share TOTAL"].sum())
+
+    # Latest month account share per voice line
+    latest_month = month_order[-1] if month_order else None
+    if latest_month:
+        _latest_shares = filtered[filtered["month"] == latest_month]
+        _voice_shares = _latest_shares[_latest_shares["line_type"] == "Voice"]["acct_share"]
+        share_example = float(_voice_shares.iloc[0]) if len(_voice_shares) > 0 else 0.0
+        n_voice_latest = len(_voice_shares)
+    else:
+        share_example = 0.0
+        n_voice_latest = 0
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Grand Total", f"${grand_total:,.2f}")
     k2.metric("Line Charges", f"${line_total_period:,.2f}")
-    k3.metric("Acct Share (all)", f"${acct_total_period:,.2f}")
-    k4.metric("Acct Share/Line (latest)", f"${share_example:,.2f}/mo")
+    k3.metric("Taxes & Fees", f"${taxes_total_period:,.2f}")
+    k4.metric("Acct Share (all)", f"${acct_total_period:,.2f}")
 
     st.caption(
-        "💡 **Account-level charges** (~$81/mo for plan fees & taxes) are divided equally "
-        f"among active lines each month. With {lines_per_month.get(month_order[-1], 0):.0f} lines "
-        f"in the latest month, each line's share is **${share_example:,.2f}/mo**. "
-        "The 'Total Due' column = Line Charge + Account Share."
+        "💡 **Account share** goes to **Voice lines only**. "
+        "Discounted voice lines (plan < $10) pay a $10 premium first; "
+        f"remaining account charges split equally among voice lines. "
+        f"MI & Wearable: **$0** account share. "
+        f"Latest month: **${share_example:,.2f}**/voice line "
+        f"across {n_voice_latest} voice lines. "
+        "**Taxes & Fees** = Total − Plan − Equipment − Services − One-Time."
     )
 
     st.divider()
 
     tab1, tab2, tab3, tab4 = st.tabs([
-        "Total Due (Line + Acct Share)", "Line Charges Only", "Heatmap", "Stacked Bar"
+        "Month Total (Line + Acct Share)", "Breakdown", "Heatmap", "Stacked Bar"
     ])
+
+    def _add_total_row(pv):
+        tr = pv.sum()
+        tr.name = "TOTAL"
+        return pd.concat([pv, tr.to_frame().T])
+
+    def _style_bold_total(s):
+        if s.name == "TOTAL":
+            return ["font-weight:bold; background-color:#E20074; color:white"] * len(s)
+        return [""] * len(s)
+
+    tbl_height = min(750, 60 + 35 * (n_lines + 2))
 
     with tab1:
         st.subheader("What Each Line Owes (incl. Account Share)")
-
-        # Build a clean display: months | Line TOTAL | Acct Share TOTAL | Total Due TOTAL
-        disp = combined_pivot_display.copy()
-        disp.insert(len(month_order), "Line TOTAL", line_pivot["Line TOTAL"])
-        disp.insert(len(month_order) + 1, "Acct Share", acct_share_pivot["Acct Share TOTAL"])
-        # Fill TOTAL row for the summary columns
-        disp.loc["TOTAL", "Line TOTAL"] = line_total_period
-        disp.loc["TOTAL", "Acct Share"] = acct_total_period
-        # Keep only month cols + 3 summary cols
-        display_cols = [m for m in month_order if m in disp.columns] + ["Line TOTAL", "Acct Share", "Total Due TOTAL"]
+        disp = mt_pivot.copy()
+        disp["Line Total"] = lt_pivot["Line TOTAL"]
+        disp["Taxes & Fees"] = tax_pivot["Taxes TOTAL"]
+        disp["Acct Share"] = as_pivot["Acct Share TOTAL"]
+        disp = _add_total_row(disp)
+        display_cols = [m for m in month_order if m in disp.columns] + \
+                       ["Line Total", "Taxes & Fees", "Acct Share", "Month Total TOTAL"]
         disp = disp[display_cols]
 
-        def _style_total_due(s):
-            if s.name == "TOTAL":
-                return ["font-weight:bold; background-color:#E20074; color:white"] * len(s)
-            return [""] * len(s)
-
         styled = disp.style.format("${:,.2f}", na_rep="-").apply(
-            _style_total_due, axis=1
+            _style_bold_total, axis=1
         ).map(
             lambda _: "font-weight:bold",
-            subset=pd.IndexSlice[:, ["Line TOTAL", "Acct Share", "Total Due TOTAL"]]
+            subset=pd.IndexSlice[:, ["Line Total", "Taxes & Fees", "Acct Share", "Month Total TOTAL"]]
         ).map(
             lambda _: "background-color:#E8F5E9",
-            subset=pd.IndexSlice[:, "Total Due TOTAL"]
+            subset=pd.IndexSlice[:, "Month Total TOTAL"]
         ).map(
             lambda _: "background-color:#FFF3CD",
             subset=pd.IndexSlice[:, "Acct Share"]
+        ).map(
+            lambda _: "background-color:#FDE8E8",
+            subset=pd.IndexSlice[:, "Taxes & Fees"]
         )
-        tbl_height = min(750, 60 + 35 * (n_lines + 2))
         st.dataframe(styled, width="stretch", height=tbl_height)
 
     with tab2:
-        st.subheader("Line Charges Only (excl. Account Share)")
-        line_disp = line_pivot.copy()
-        lt_row = line_disp.sum()
-        lt_row.name = "TOTAL"
-        line_disp = pd.concat([line_disp, lt_row.to_frame().T])
+        st.subheader("Charge Breakdown by Line")
+        bk = filtered.groupby("phone_number").agg(
+            Plan=("plan", "sum"), Equipment=("equipment", "sum"),
+            Services=("services", "sum"), **{"One-Time": ("onetime", "sum")},
+            **{"Taxes & Fees": ("taxes_fees", "sum")},
+            **{"Line Total": ("line_total", "sum")},
+            **{"Acct Share": ("acct_share", "sum")},
+            **{"Month Total": ("month_total", "sum")},
+        ).reset_index()
+        bk["Name"] = bk["phone_number"].map(_name_map).fillna(bk["phone_number"])
+        bk["Type"] = bk["phone_number"].map(
+            filtered.drop_duplicates("phone_number").set_index("phone_number")["line_type"]
+        )
+        bk = bk[["Name", "phone_number", "Type", "Plan", "Equipment", "Services",
+                  "One-Time", "Taxes & Fees", "Line Total", "Acct Share", "Month Total"]]
+        bk = bk.sort_values("Month Total", ascending=False)
 
-        def _style_line_only(s):
-            if s.name == "TOTAL":
+        # TOTAL row
+        totals = {c: bk[c].sum() for c in bk.columns if c not in ("Name", "phone_number", "Type")}
+        totals.update({"Name": "TOTAL", "phone_number": "", "Type": ""})
+        bk = pd.concat([bk, pd.DataFrame([totals])], ignore_index=True)
+
+        def _style_bk(s):
+            if s.get("Name") == "TOTAL":
                 return ["font-weight:bold; background-color:#E20074; color:white"] * len(s)
             return [""] * len(s)
 
-        styled2 = line_disp.style.format("${:,.2f}", na_rep="-").apply(
-            _style_line_only, axis=1
-        ).map(
-            lambda _: "font-weight:bold",
-            subset=pd.IndexSlice[:, "Line TOTAL"]
-        )
-        tbl_height2 = min(750, 60 + 35 * (n_lines + 2))
-        st.dataframe(styled2, width="stretch", height=tbl_height2)
+        fmt = {c: "${:,.2f}" for c in bk.columns if c not in ("Name", "phone_number", "Type")}
+        styled_bk = bk.style.format(fmt, na_rep="-").apply(_style_bk, axis=1)
+        st.dataframe(styled_bk, width="stretch", height=tbl_height, hide_index=True)
 
     with tab3:
-        st.subheader("Total Due Heatmap")
-        heat = combined_pivot.drop(columns=["Total Due TOTAL"], errors="ignore")
+        st.subheader("Month Total Heatmap")
+        heat = mt_pivot.drop(columns=["Month Total TOTAL"], errors="ignore")
         fig = px.imshow(
             heat.fillna(0).values,
             x=heat.columns.tolist(), y=heat.index.tolist(),
             color_continuous_scale=[[0, "#FFF0F6"], [0.5, "#E20074"], [1, "#8B004A"]],
             aspect="auto",
-            title="Total Due Heatmap — Line Charge + Account Share (Phone × Month)",
+            title="Month Total Heatmap — Line Charge + Acct Share (Phone × Month)",
             labels=dict(x="Month", y="Phone Number", color="$ Amount"),
         )
         fig.update_traces(text=heat.fillna(0).map(lambda v: f"${v:,.0f}").values,
@@ -914,18 +1026,14 @@ elif page == "Line Cost by Month":
         st.plotly_chart(fig, width="stretch")
 
     with tab4:
-        st.subheader("Monthly Total Due by Line (Stacked)")
-        # Build bar data from combined (line + share)
-        bar_src = filtered.copy()
-        bar_src["acct_share"] = bar_src["month"].map(share_per_month).fillna(0)
-        bar_src["total_due"] = bar_src["line_total"] + bar_src["acct_share"]
-        bar_data = bar_src.groupby(["month", "phone_number"])["total_due"].sum().reset_index()
+        st.subheader("Monthly Total by Line (Stacked)")
+        bar_data = filtered.groupby(["month", "phone_number"])["month_total"].sum().reset_index()
         bar_data["month"] = pd.Categorical(bar_data["month"], categories=month_order, ordered=True)
         bar_data = bar_data.sort_values("month")
         fig = px.bar(
-            bar_data, x="month", y="total_due", color="phone_number",
-            title="Monthly Total Due by Line (incl. Account Share)",
-            labels={"month": "Month", "total_due": "Total Due ($)", "phone_number": "Phone"},
+            bar_data, x="month", y="month_total", color="phone_number",
+            title="Monthly Total Due by Line (incl. Taxes & Acct Share)",
+            labels={"month": "Month", "month_total": "Month Total ($)", "phone_number": "Phone"},
             barmode="stack",
         )
         fig.update_layout(xaxis_tickangle=-45, height=550, legend=dict(font=dict(size=9)))
@@ -936,79 +1044,154 @@ elif page == "Line Cost by Month":
 #  PAGE: Person View
 # ════════════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════════════════════
-#  PAGE: Person View
-# ════════════════════════════════════════════════════════════════════
-
 elif page == "Person View":
     st.title("Person-Level Analysis")
+
+    # ── Build full splitup with account share across all months ────
+    _name_map_pv = (
+        persons.drop_duplicates("phone_number")
+        .set_index("phone_number")["person_label"].to_dict()
+    )
+    _phone_person = {}  # phone -> person_label (respecting effective dates)
+    for _, pr in persons.iterrows():
+        _phone_person[pr["phone_number"]] = pr["person_label"]
+
+    pv_rows = []
+    for bill_date in line_charges["bill_date"].unique():
+        lc_m = line_charges[line_charges["bill_date"] == bill_date]
+        sp = _build_month_splitup(lc_m)
+        sp["bill_date"] = bill_date
+        sp["month"] = pd.Timestamp(bill_date).strftime("%b %Y")
+        pv_rows.append(sp)
+    pv_all = pd.concat(pv_rows, ignore_index=True) if pv_rows else pd.DataFrame()
+
+    if not pv_all.empty:
+        # Map phones to persons via person_monthly (which respects effective dates)
+        pm_phone_person = person_monthly[["phone_number", "bill_date", "person_label"]].drop_duplicates()
+        pv_all = pv_all.merge(pm_phone_person, on=["phone_number", "bill_date"], how="left")
+        pv_all["person_label"] = pv_all["person_label"].fillna(
+            pv_all["phone_number"].map(_name_map_pv)
+        ).fillna(pv_all["phone_number"])
 
     tab1, tab2 = st.tabs(["Totals", "Monthly Drill-down"])
 
     with tab1:
         st.subheader("Total Cost per Person (All Months)")
-        fig = px.bar(
-            person_totals.sort_values("grand_total", ascending=True),
-            x="grand_total", y="person_label", orientation="h",
-            color="grand_total", color_continuous_scale=["#FFB900", "#E20074"],
-            title="Total Cost by Person",
-            labels={"grand_total": "Total ($)", "person_label": "Person"},
-        )
-        fig.update_layout(height=600, showlegend=False)
-        st.plotly_chart(fig, width='stretch')
 
-        st.dataframe(person_totals, width='stretch', hide_index=True)
+        if not pv_all.empty:
+            pt = pv_all.groupby("person_label").agg(
+                total_plan=("plan", "sum"),
+                total_equipment=("equipment", "sum"),
+                total_services=("services", "sum"),
+                total_onetime=("onetime", "sum"),
+                total_taxes=("taxes_fees", "sum"),
+                total_line=("line_total", "sum"),
+                total_acct_share=("acct_share", "sum"),
+                grand_total=("month_total", "sum"),
+                months=("month", "nunique"),
+            ).reset_index().sort_values("grand_total", ascending=False)
+
+            fig = px.bar(
+                pt.sort_values("grand_total", ascending=True),
+                x="grand_total", y="person_label", orientation="h",
+                color="grand_total", color_continuous_scale=["#FFB900", "#E20074"],
+                title="Total Cost by Person (incl. Acct Share)",
+                labels={"grand_total": "Total ($)", "person_label": "Person"},
+            )
+            fig.update_layout(height=600, showlegend=False)
+            st.plotly_chart(fig, width='stretch')
+
+            # Display table
+            pt_disp = pt.rename(columns={
+                "person_label": "Person", "total_plan": "Plan",
+                "total_equipment": "Equipment", "total_services": "Services",
+                "total_onetime": "One-Time", "total_taxes": "Taxes & Fees",
+                "total_line": "Line Total", "total_acct_share": "Acct Share",
+                "grand_total": "Grand Total", "months": "Months",
+            })
+            pt_disp = pt_disp[["Person", "Months", "Plan", "Equipment", "Services",
+                               "One-Time", "Taxes & Fees", "Line Total", "Acct Share", "Grand Total"]]
+            st.dataframe(pt_disp, width='stretch', hide_index=True)
+        else:
+            st.warning("No data available.")
 
         st.subheader("Person - Phone Mapping")
         st.dataframe(persons, width='stretch', hide_index=True)
 
     with tab2:
         st.subheader("Monthly Cost per Person")
-        person_list = person_totals["person_label"].tolist()
+        person_list = sorted(pv_all["person_label"].unique().tolist()) if not pv_all.empty else []
         sel_person = st.selectbox("Select person", person_list)
 
-        p_data = person_monthly[person_monthly["person_label"] == sel_person].copy()
-        p_data["month"] = p_data["bill_date"].apply(
-            lambda d: d.strftime("%b %Y") if hasattr(d, "strftime") else str(d)[:7]
-        )
-        monthly_agg = p_data.groupby("month", sort=False).agg(
-            total=("line_total", "sum"), plans=("plans_charge", "sum"),
-            equipment=("equipment_charge", "sum"), services=("services_charge", "sum"),
-            onetime=("onetime_charge", "sum"),
-        ).reset_index()
+        p_data = pv_all[pv_all["person_label"] == sel_person].copy() if sel_person else pd.DataFrame()
 
-        fig = px.bar(
-            monthly_agg, x="month", y="total",
-            color_discrete_sequence=["#E20074"],
-            title=f"Monthly Total - {sel_person}",
-            labels={"month": "Month", "total": "Total ($)"},
-        )
-        fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, width='stretch')
-
-        _plan_sum = float(p_data["plans_charge"].sum())
-        _equip_sum = float(p_data["equipment_charge"].sum())
-        _svc_sum = float(p_data["services_charge"].sum())
-        _ot_sum = float(p_data["onetime_charge"].sum())
-        _total_sum = float(p_data["line_total"].sum())
-        _tax_sum = round(_total_sum - _plan_sum - _equip_sum - _svc_sum - _ot_sum, 2)
-        cats = {
-            "Plan": _plan_sum,
-            "Equipment": _equip_sum,
-            "Services": _svc_sum,
-            "One-Time": _ot_sum,
-            "Taxes & Fees": _tax_sum,
-        }
-        cats = {k: v for k, v in cats.items() if v != 0}
-        if cats:
-            fig2 = px.pie(
-                names=list(cats.keys()), values=list(cats.values()),
-                title=f"Charge Mix - {sel_person}",
-                color_discrete_sequence=["#E20074", "#5C2D91", "#0078D4", "#FFB900", "#107C10"],
+        if not p_data.empty:
+            month_order_pv = invoices.sort_values("bill_date")["label"].tolist()
+            monthly_agg = p_data.groupby("month", sort=False).agg(
+                plan=("plan", "sum"), equipment=("equipment", "sum"),
+                services=("services", "sum"), onetime=("onetime", "sum"),
+                taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
+                acct_share=("acct_share", "sum"), month_total=("month_total", "sum"),
+            ).reset_index()
+            monthly_agg["month"] = pd.Categorical(
+                monthly_agg["month"],
+                categories=[m for m in month_order_pv if m in monthly_agg["month"].values],
+                ordered=True,
             )
-            st.plotly_chart(fig2, width='stretch')
+            monthly_agg = monthly_agg.sort_values("month")
 
-        st.dataframe(p_data, width='stretch', hide_index=True)
+            # Bar chart showing month_total (includes acct share)
+            fig = px.bar(
+                monthly_agg, x="month", y="month_total",
+                color_discrete_sequence=["#E20074"],
+                title=f"Monthly Total - {sel_person} (incl. Acct Share)",
+                labels={"month": "Month", "month_total": "Month Total ($)"},
+            )
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, width='stretch')
+
+            # Pie chart with all categories including acct share
+            _plan_sum = float(p_data["plan"].sum())
+            _equip_sum = float(p_data["equipment"].sum())
+            _svc_sum = float(p_data["services"].sum())
+            _ot_sum = float(p_data["onetime"].sum())
+            _tax_sum = float(p_data["taxes_fees"].sum())
+            _acct_sum = float(p_data["acct_share"].sum())
+            cats = {
+                "Plan": _plan_sum,
+                "Equipment": _equip_sum,
+                "Services": _svc_sum,
+                "One-Time": _ot_sum,
+                "Taxes & Fees": _tax_sum,
+                "Acct Share": _acct_sum,
+            }
+            cats = {k: v for k, v in cats.items() if v != 0}
+            if cats:
+                fig2 = px.pie(
+                    names=list(cats.keys()), values=list(cats.values()),
+                    title=f"Charge Mix - {sel_person} (incl. Acct Share)",
+                    color_discrete_sequence=["#E20074", "#5C2D91", "#0078D4", "#FFB900", "#107C10", "#FF6F61"],
+                )
+                st.plotly_chart(fig2, width='stretch')
+
+            # Detail table
+            detail_cols = {
+                "month": "Month", "phone_number": "Phone", "line_type": "Type",
+                "plan": "Plan", "equipment": "Equipment", "services": "Services",
+                "onetime": "One-Time", "taxes_fees": "Taxes & Fees",
+                "line_total": "Line Total", "acct_share": "Acct Share",
+                "month_total": "Month Total",
+            }
+            p_disp = p_data[list(detail_cols.keys())].rename(columns=detail_cols)
+            p_disp["Month"] = pd.Categorical(
+                p_disp["Month"],
+                categories=[m for m in month_order_pv if m in p_disp["Month"].values],
+                ordered=True,
+            )
+            p_disp = p_disp.sort_values(["Month", "Phone"])
+            st.dataframe(p_disp, width='stretch', hide_index=True)
+        else:
+            st.info("No data for selected person.")
 
 
 # ════════════════════════════════════════════════════════════════════
