@@ -1699,7 +1699,6 @@ elif page == "Balances":
     import requests as _requests
     from datetime import date as _date, datetime as _datetime
 
-    _ADMIN_LABEL = "Sathish"
     _APP_URL = "https://tmobilebillanalysis-w8t9cas3jwk6u4cc6qqwea.streamlit.app"
 
     # ── helper: send email via SendGrid ────────────────────────────
@@ -1726,25 +1725,51 @@ elif page == "Balances":
             return True, "Sent"
         return False, f"SendGrid error {resp.status_code}: {resp.text[:200]}"
 
-    # ── Load billing accounts & members ────────────────────────────
-    _ba_df = run_query("SELECT * FROM billing_accounts ORDER BY is_admin DESC, account_label")
-    _am_df = run_query("SELECT * FROM account_members ORDER BY account_label, relationship")
-    _stl_df = run_query("SELECT * FROM settlements ORDER BY payment_date DESC")
+    # ── Load accounts & settlements ────────────────────────────────
+    _accts_df = run_query("SELECT * FROM accounts ORDER BY account_type, account_name")
+    _stl_df   = run_query("SELECT * FROM settlements ORDER BY payment_date DESC")
 
-    _ba_map = {}  # account_label -> {contact_email, is_admin}
-    for _, br in _ba_df.iterrows():
-        _ba_map[br["account_label"]] = {"email": br["contact_email"], "is_admin": br["is_admin"]}
+    # Lookup maps
+    _acct_map = {}        # phone -> full row dict
+    _primary_phones = []  # list of primary phone numbers
+    _admin_phone = None
+    for _, ar in _accts_df.iterrows():
+        _acct_map[ar["phone_number"]] = {
+            "name": ar["account_name"], "type": ar["account_type"],
+            "primary_phone": ar["primary_phone"], "relationship": ar["relationship"],
+            "email": ar["contact_email"], "is_admin": ar["is_admin"],
+        }
+        if ar["account_type"] == "Primary":
+            _primary_phones.append(ar["phone_number"])
+        if ar["is_admin"]:
+            _admin_phone = ar["phone_number"]
 
-    # Build phone → account_label mapping from account_members
-    _phone_to_acct = {}
-    for _, mr in _am_df.iterrows():
-        _phone_to_acct[mr["phone_number"]] = mr["account_label"]
+    _ADMIN_LABEL = _acct_map[_admin_phone]["name"] if _admin_phone else "Admin"
 
-    # ── Build full per-line splitup across ALL months ──────────────
+    # Children grouped by primary
+    _children_of = {}  # primary_phone -> [child phone rows]
+    for _, ar in _accts_df.iterrows():
+        if ar["account_type"] == "Child" and ar["primary_phone"]:
+            _children_of.setdefault(ar["primary_phone"], []).append(ar)
+
+    # Unassigned phones (in lines table but NOT in accounts)
+    _all_lines = run_query("SELECT phone_number, line_type FROM lines ORDER BY line_type, phone_number")
+    _registered = set(_accts_df["phone_number"].tolist()) if not _accts_df.empty else set()
     _name_map_bal = (
         persons.drop_duplicates("phone_number")
         .set_index("phone_number")["person_label"].to_dict()
     )
+    _unassigned_df = _all_lines[~_all_lines["phone_number"].isin(_registered)]
+
+    # Phones mapped to each primary (primary's own + children)
+    def _get_family_phones(primary_phone):
+        """Return set of all phone numbers in a primary account's family."""
+        phones = {primary_phone}
+        for child in _children_of.get(primary_phone, []):
+            phones.add(child["phone_number"])
+        return phones
+
+    # ── Build full per-line splitup across ALL months ──────────────
     bal_rows = []
     for bd in line_charges["bill_date"].unique():
         lc_m = line_charges[line_charges["bill_date"] == bd]
@@ -1760,142 +1785,259 @@ elif page == "Balances":
         bal_all["person_label"] = bal_all["person_label"].fillna(
             bal_all["phone_number"].map(_name_map_bal)
         ).fillna(bal_all["phone_number"])
-        # Map phone → account_label
-        bal_all["account_label"] = bal_all["phone_number"].map(_phone_to_acct)
 
-    # All available months
     _all_months = sorted(bal_all["month"].unique().tolist(), reverse=True) if not bal_all.empty else []
 
     # ━━━━ TABS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     tab_accts, tab_summary, tab_pay, tab_history, tab_email = st.tabs([
-        "👥 Accounts", "📊 Balance Summary", "💵 Record Payment",
+        "👥 Account Management", "📊 Balance Summary", "💵 Record Payment",
         "📜 Payment History", "✉️ Send Email",
     ])
 
     # ─────────────────────────────────────────────────────────────
-    # TAB 1: Accounts — manage billing accounts & members
+    # TAB 1: Account Management — hierarchical tree view
     # ─────────────────────────────────────────────────────────────
     with tab_accts:
-        st.subheader("Billing Accounts")
+        st.subheader("Account Hierarchy")
         st.caption(
-            "Each billing account is a person (or family) who owes their share to the "
-            f"T-Mobile admin (**{_ADMIN_LABEL}**). Map phone lines to accounts below."
+            "**Primary** accounts pay their family share to the T-Mobile admin. "
+            "**Child** accounts roll up under a primary. "
+            "**Individual** accounts stand alone."
         )
 
-        # Show current accounts
-        if not _ba_df.empty:
-            for _, ba in _ba_df.iterrows():
-                lbl = ba["account_label"]
-                is_adm = ba["is_admin"]
-                badge = " 👑 Admin" if is_adm else ""
-                with st.expander(f"**{lbl}**{badge}  —  {ba['contact_email'] or 'no email'}", expanded=False):
-                    members = _am_df[_am_df["account_label"] == lbl]
-                    if members.empty:
-                        st.info("No members mapped yet. Add phones below.")
-                    else:
-                        m_disp = members[["person_label", "phone_number", "relationship"]].rename(columns={
-                            "person_label": "Name", "phone_number": "Phone", "relationship": "Relationship",
+        # ── Tree view ──────────────────────────────────────────────
+        if _primary_phones:
+            for pp in _primary_phones:
+                info = _acct_map[pp]
+                badge = " 👑 Admin" if info["is_admin"] else ""
+                email_lbl = info["email"] or "no email"
+                with st.expander(
+                    f"🏠 **{info['name']}** ({pp}){badge}  ·  {email_lbl}",
+                    expanded=False,
+                ):
+                    children = _children_of.get(pp, [])
+                    rows_disp = [{"Name": info["name"], "Phone": pp,
+                                  "Relationship": "Self", "Type": "Primary"}]
+                    for ch in children:
+                        rows_disp.append({
+                            "Name": ch["account_name"], "Phone": ch["phone_number"],
+                            "Relationship": ch["relationship"] or "—",
+                            "Type": "Child",
                         })
-                        st.dataframe(m_disp, use_container_width=True, hide_index=True)
-                        # Delete a member
-                        del_phones = members["phone_number"].tolist()
-                        dc1, dc2 = st.columns([3, 1])
-                        del_ph = dc1.selectbox("Remove phone", del_phones, key=f"del_mem_{lbl}")
-                        if dc2.button("🗑️", key=f"del_mem_btn_{lbl}"):
+                    st.dataframe(pd.DataFrame(rows_disp), use_container_width=True, hide_index=True)
+
+                    # Remove a child
+                    if children:
+                        ch_opts = [f"{ch['account_name']} ({ch['phone_number']})" for ch in children]
+                        rc1, rc2, rc3 = st.columns([3, 1, 1])
+                        sel_ch = rc1.selectbox("Select child", ch_opts, key=f"rc_{pp}")
+                        sel_ch_phone = sel_ch.split("(")[-1].rstrip(")") if sel_ch else ""
+                        if rc2.button("🔓 Unlink", key=f"unlink_{pp}",
+                                      help="Convert to Individual (keeps account)"):
                             get_con().execute(
-                                "DELETE FROM account_members WHERE account_label=? AND phone_number=?",
-                                [lbl, del_ph],
-                            )
+                                "UPDATE accounts SET account_type='Individual', "
+                                "primary_phone=NULL, relationship='Self' WHERE phone_number=?",
+                                [sel_ch_phone])
                             get_con().execute("CHECKPOINT")
                             st.rerun()
-        else:
-            st.info("No billing accounts yet. Create one below.")
+                        if rc3.button("🗑️ Delete", key=f"delch_{pp}",
+                                      help="Remove account entirely"):
+                            get_con().execute("DELETE FROM accounts WHERE phone_number=?",
+                                              [sel_ch_phone])
+                            get_con().execute("CHECKPOINT")
+                            st.rerun()
+
+        # Individual accounts
+        indiv_df = _accts_df[_accts_df["account_type"] == "Individual"]
+        if not indiv_df.empty:
+            st.markdown("---")
+            st.markdown("**📱 Individual Accounts** *(not linked to any primary)*")
+            indiv_disp = indiv_df[["account_name", "phone_number", "contact_email"]].rename(columns={
+                "account_name": "Name", "phone_number": "Phone", "contact_email": "Email",
+            })
+            st.dataframe(indiv_disp, use_container_width=True, hide_index=True)
+
+        # Unassigned phones
+        if not _unassigned_df.empty:
+            st.markdown("---")
+            st.markdown(f"**⚠️ Unassigned Phone Lines** ({len(_unassigned_df)})")
+            ua_disp = _unassigned_df.copy()
+            ua_disp["person_name"] = ua_disp["phone_number"].map(_name_map_bal).fillna("—")
+            ua_disp = ua_disp.rename(columns={
+                "phone_number": "Phone", "line_type": "Line Type", "person_name": "Known Name",
+            })
+            st.dataframe(ua_disp[["Phone", "Known Name", "Line Type"]],
+                         use_container_width=True, hide_index=True)
 
         st.divider()
 
-        # ── Add / Edit account ──────────────────────────────────
-        st.subheader("Create / Edit Account")
-        with st.form("upsert_account", clear_on_submit=True):
-            ac1, ac2 = st.columns(2)
-            acct_name = ac1.text_input("Account Name (e.g. Ganesh)")
-            acct_email = ac2.text_input("Contact Email")
-            acct_admin = st.checkbox("Is T-Mobile Admin?", value=False)
-            if st.form_submit_button("💾 Save Account", type="primary"):
-                if acct_name.strip():
+        # ── Create Primary Account ──────────────────────────────
+        st.subheader("➕ Create Primary Account")
+        # Eligible: unassigned phones + individual accounts
+        _eligible_primary = []
+        for _, r in _unassigned_df.iterrows():
+            _eligible_primary.append(f"{r['phone_number']}  ({_name_map_bal.get(r['phone_number'], '?')}, {r['line_type']})")
+        for _, r in indiv_df.iterrows():
+            _eligible_primary.append(f"{r['phone_number']}  ({r['account_name']}, Individual)")
+
+        with st.form("create_primary", clear_on_submit=True):
+            cp1, cp2 = st.columns(2)
+            if _eligible_primary:
+                cp_phone_disp = cp1.selectbox("Phone Line", _eligible_primary, key="cp_phone")
+                cp_phone = cp_phone_disp.split("  (")[0] if cp_phone_disp else ""
+            else:
+                cp1.info("No unassigned lines available.")
+                cp_phone = ""
+            cp_name = cp2.text_input("Account Name", key="cp_name")
+            cp3, cp4 = st.columns(2)
+            cp_email = cp3.text_input("Contact Email (optional)", key="cp_email")
+            cp_admin = cp4.checkbox("T-Mobile Admin?", value=False, key="cp_admin")
+
+            if st.form_submit_button("🏠 Create Primary", type="primary"):
+                if cp_phone and cp_name.strip():
+                    final_name = cp_name.strip()
                     con = get_con()
                     con.execute(
-                        "INSERT OR REPLACE INTO billing_accounts VALUES (?, ?, ?)",
-                        [acct_name.strip(), acct_email.strip() or None, acct_admin],
+                        "INSERT OR REPLACE INTO accounts VALUES (?, ?, 'Primary', NULL, 'Self', ?, ?)",
+                        [cp_phone, final_name, cp_email.strip() or None, cp_admin],
                     )
                     con.execute("CHECKPOINT")
-                    st.success(f"✅ Account **{acct_name.strip()}** saved.")
+                    st.success(f"✅ Created primary account **{final_name}** ({cp_phone})")
                     st.rerun()
                 else:
-                    st.warning("Account name is required.")
+                    st.warning("Select a phone and enter an account name.")
 
-        # ── Add member to account ───────────────────────────────
+        # ── Add Child to Primary ────────────────────────────────
         st.divider()
-        st.subheader("Add Member to Account")
-        acct_labels = _ba_df["account_label"].tolist() if not _ba_df.empty else []
-        # All phones from lines dimension
-        all_lines = run_query("SELECT phone_number, line_type FROM lines ORDER BY line_type, phone_number")
-        assigned_phones = set(_am_df["phone_number"].tolist()) if not _am_df.empty else set()
-        unassigned = all_lines[~all_lines["phone_number"].isin(assigned_phones)]
-        unassigned_display = [
-            f"{r['phone_number']}  ({_name_map_bal.get(r['phone_number'], '?')}, {r['line_type']})"
-            for _, r in unassigned.iterrows()
+        st.subheader("👶 Add Child Account to a Primary")
+
+        # Eligible for child: unassigned + individual (not already primary with children)
+        _eligible_child = []
+        for _, r in _unassigned_df.iterrows():
+            _eligible_child.append(f"{r['phone_number']}  ({_name_map_bal.get(r['phone_number'], '?')}, {r['line_type']})")
+        for _, r in indiv_df.iterrows():
+            _eligible_child.append(f"{r['phone_number']}  ({r['account_name']}, Individual)")
+
+        _primary_labels = [
+            f"{_acct_map[p]['name']} ({p})" for p in _primary_phones
         ]
 
-        with st.form("add_member", clear_on_submit=True):
-            mc1, mc2 = st.columns(2)
-            sel_acct = mc1.selectbox("Account", acct_labels, key="add_mem_acct")
-            sel_rel = mc2.selectbox("Relationship", ["Self", "Wife", "Husband", "Son", "Daughter",
-                                                      "Parent", "Sibling", "MI Device", "Wearable", "Other"])
-            if unassigned_display:
-                sel_phone_disp = st.selectbox("Phone Line", unassigned_display, key="add_mem_phone")
-                sel_phone = sel_phone_disp.split("  (")[0] if sel_phone_disp else ""
+        with st.form("add_child", clear_on_submit=True):
+            ac1, ac2 = st.columns(2)
+            if _primary_labels:
+                sel_primary_disp = ac1.selectbox("Parent Primary", _primary_labels, key="ac_parent")
+                sel_primary_ph = sel_primary_disp.split("(")[-1].rstrip(")") if sel_primary_disp else ""
             else:
-                st.info("All phone lines are assigned.")
-                sel_phone = ""
-            mem_name = st.text_input("Member Name (auto-detected from Phone Directory)", value="")
+                ac1.warning("Create a Primary account first.")
+                sel_primary_ph = ""
 
-            if st.form_submit_button("➕ Add Member", type="primary"):
-                if sel_acct and sel_phone:
-                    final_name = mem_name.strip() or _name_map_bal.get(sel_phone, sel_phone)
+            sel_rel = ac2.selectbox("Relationship", [
+                "Wife", "Husband", "Son", "Daughter", "Parent",
+                "Sibling", "MI Device", "Wearable", "Other",
+            ], key="ac_rel")
+
+            if _eligible_child:
+                sel_child_disp = st.selectbox("Phone Line", _eligible_child, key="ac_child_phone")
+                sel_child_ph = sel_child_disp.split("  (")[0] if sel_child_disp else ""
+            else:
+                st.info("No unassigned/individual lines available to add.")
+                sel_child_ph = ""
+
+            ac_name = st.text_input("Child Name (auto-fill from directory)", value="", key="ac_childname")
+
+            if st.form_submit_button("👶 Add Child", type="primary"):
+                if sel_primary_ph and sel_child_ph:
+                    final_name = ac_name.strip() or _name_map_bal.get(sel_child_ph, sel_child_ph)
                     con = get_con()
                     con.execute(
-                        "INSERT OR REPLACE INTO account_members VALUES (?, ?, ?, ?)",
-                        [sel_acct, final_name, sel_phone, sel_rel],
+                        "INSERT OR REPLACE INTO accounts VALUES (?, ?, 'Child', ?, ?, NULL, FALSE)",
+                        [sel_child_ph, final_name, sel_primary_ph, sel_rel],
                     )
                     con.execute("CHECKPOINT")
-                    st.success(f"✅ Added **{final_name}** ({sel_phone}) to **{sel_acct}** as {sel_rel}.")
+                    st.success(f"✅ Added **{final_name}** ({sel_child_ph}) as {sel_rel} under "
+                               f"**{_acct_map.get(sel_primary_ph, {}).get('name', sel_primary_ph)}**")
                     st.rerun()
                 else:
-                    st.warning("Select an account and a phone line.")
+                    st.warning("Select both a primary and a phone line.")
 
-        # ── Delete account ──────────────────────────────────────
+        # ── Reassign Child ──────────────────────────────────────
+        all_children = _accts_df[_accts_df["account_type"] == "Child"]
+        if not all_children.empty:
+            st.divider()
+            st.subheader("🔄 Reassign Child to Different Primary")
+            with st.form("reassign_child", clear_on_submit=False):
+                ra1, ra2 = st.columns(2)
+                ch_labels = [
+                    f"{r['account_name']} ({r['phone_number']})" for _, r in all_children.iterrows()
+                ]
+                sel_reassign = ra1.selectbox("Child to reassign", ch_labels, key="ra_child")
+                sel_new_parent_disp = ra2.selectbox("New Primary", _primary_labels, key="ra_newparent")
+                sel_ra_ph = sel_reassign.split("(")[-1].rstrip(")") if sel_reassign else ""
+                sel_new_pp = sel_new_parent_disp.split("(")[-1].rstrip(")") if sel_new_parent_disp else ""
+
+                if st.form_submit_button("🔄 Reassign", type="primary"):
+                    if sel_ra_ph and sel_new_pp:
+                        con = get_con()
+                        con.execute(
+                            "UPDATE accounts SET primary_phone=? WHERE phone_number=?",
+                            [sel_new_pp, sel_ra_ph])
+                        con.execute("CHECKPOINT")
+                        st.success(f"✅ Reassigned to **{_acct_map.get(sel_new_pp, {}).get('name', '')}**")
+                        st.rerun()
+
+        # ── Edit Account Details ────────────────────────────────
         st.divider()
-        non_admin_accts = [a for a in acct_labels if not _ba_map.get(a, {}).get("is_admin", False)]
-        if non_admin_accts:
-            st.subheader("Delete Account")
-            del_acct = st.selectbox("Account to delete", non_admin_accts, key="del_acct_sel")
-            if st.button("🗑️ Delete Account & Members", key="del_acct_btn"):
+        st.subheader("✏️ Edit Account Details")
+        _all_acct_labels = [
+            f"{r['account_name']} ({r['phone_number']})" for _, r in _accts_df.iterrows()
+        ]
+        if _all_acct_labels:
+            sel_edit_disp = st.selectbox("Select account to edit", _all_acct_labels, key="edit_sel")
+            sel_edit_ph = sel_edit_disp.split("(")[-1].rstrip(")") if sel_edit_disp else ""
+            if sel_edit_ph and sel_edit_ph in _acct_map:
+                cur = _acct_map[sel_edit_ph]
+                with st.form("edit_account", clear_on_submit=False):
+                    ed1, ed2 = st.columns(2)
+                    ed_name = ed1.text_input("Name", value=cur["name"], key="ed_name")
+                    ed_email = ed2.text_input("Email", value=cur["email"] or "", key="ed_email")
+                    if st.form_submit_button("💾 Update", type="primary"):
+                        con = get_con()
+                        con.execute(
+                            "UPDATE accounts SET account_name=?, contact_email=? WHERE phone_number=?",
+                            [ed_name.strip(), ed_email.strip() or None, sel_edit_ph])
+                        con.execute("CHECKPOINT")
+                        st.success(f"✅ Updated **{ed_name.strip()}**")
+                        st.rerun()
+
+        # ── Delete Primary Account ──────────────────────────────
+        non_admin_primaries = [p for p in _primary_phones
+                               if not _acct_map[p].get("is_admin", False)]
+        if non_admin_primaries:
+            st.divider()
+            st.subheader("🗑️ Delete Primary Account")
+            st.caption("Deleting a primary converts all its children to Individual.")
+            del_labels = [f"{_acct_map[p]['name']} ({p})" for p in non_admin_primaries]
+            del_sel = st.selectbox("Primary to delete", del_labels, key="del_prim_sel")
+            del_ph = del_sel.split("(")[-1].rstrip(")") if del_sel else ""
+            if st.button("🗑️ Delete Primary", key="del_prim_btn"):
                 con = get_con()
-                con.execute("DELETE FROM account_members WHERE account_label = ?", [del_acct])
-                con.execute("DELETE FROM settlements WHERE account_label = ?", [del_acct])
-                con.execute("DELETE FROM billing_accounts WHERE account_label = ?", [del_acct])
+                # Convert children to Individual
+                con.execute(
+                    "UPDATE accounts SET account_type='Individual', primary_phone=NULL, "
+                    "relationship='Self' WHERE primary_phone=?", [del_ph])
+                con.execute("DELETE FROM accounts WHERE phone_number=?", [del_ph])
+                con.execute("DELETE FROM settlements WHERE primary_phone=?", [del_ph])
                 con.execute("CHECKPOINT")
-                st.success(f"Deleted account **{del_acct}** and all its members/settlements.")
+                st.success(f"Deleted **{_acct_map[del_ph]['name']}**. Children converted to Individual.")
                 st.rerun()
 
     # ─────────────────────────────────────────────────────────────
-    # TAB 2: Balance Summary — per account, with month filter
+    # TAB 2: Balance Summary — per primary account
     # ─────────────────────────────────────────────────────────────
     with tab_summary:
         st.subheader("Account Balances")
-        st.caption(f"Each non-admin account owes their family total to **{_ADMIN_LABEL}**.")
+        st.caption(f"Each non-admin primary account owes their family total to **{_ADMIN_LABEL}**.")
 
-        # Month filter
         month_filter = st.multiselect(
             "Filter by months (leave empty = all months)", _all_months,
             key="bal_month_filter",
@@ -1908,62 +2050,56 @@ elif page == "Balances":
             if month_filter:
                 filtered = filtered[filtered["month"].isin(month_filter)]
 
-            # Only lines mapped to accounts
-            mapped = filtered[filtered["account_label"].notna()].copy()
-            if mapped.empty:
-                st.warning("No phone lines mapped to billing accounts yet. Go to **Accounts** tab.")
-            else:
-                # Aggregate per account
-                acct_owed = (
-                    mapped.groupby("account_label")["month_total"].sum()
-                    .reset_index()
-                    .rename(columns={"month_total": "total_owed"})
-                )
-
-                # Settlements — filter if months selected
+            # Build per-primary aggregation
+            summary_rows = []
+            for pp in _primary_phones:
+                family = _get_family_phones(pp)
+                fam_data = filtered[filtered["phone_number"].isin(family)]
+                total_owed = float(fam_data["month_total"].sum()) if not fam_data.empty else 0.0
+                # Settlements
                 if not _stl_df.empty:
-                    stl_filt = _stl_df.copy()
+                    stl_pp = _stl_df[_stl_df["primary_phone"] == pp]
                     if month_filter:
-                        stl_filt = stl_filt[stl_filt["bill_month"].isin(month_filter) | stl_filt["bill_month"].isna()]
-                    acct_paid = (
-                        stl_filt.groupby("account_label")["amount"].sum()
-                        .reset_index()
-                        .rename(columns={"amount": "total_paid"})
-                    )
+                        stl_pp = stl_pp[stl_pp["bill_month"].isin(month_filter) | stl_pp["bill_month"].isna()]
+                    total_paid = float(stl_pp["amount"].sum())
                 else:
-                    acct_paid = pd.DataFrame(columns=["account_label", "total_paid"])
+                    total_paid = 0.0
+                info = _acct_map[pp]
+                summary_rows.append({
+                    "primary_phone": pp, "account": info["name"],
+                    "is_admin": info["is_admin"],
+                    "email": info["email"] or "—",
+                    "members": len(family),
+                    "total_owed": round(total_owed, 2),
+                    "total_paid": round(total_paid, 2),
+                    "balance": round(total_owed - total_paid, 2),
+                })
 
-                balance_df = acct_owed.merge(acct_paid, on="account_label", how="left")
-                balance_df["total_paid"] = balance_df["total_paid"].fillna(0).infer_objects(copy=False)
-                balance_df["balance"] = (balance_df["total_owed"] - balance_df["total_paid"]).round(2)
-                balance_df["is_admin"] = balance_df["account_label"].map(
-                    lambda a: _ba_map.get(a, {}).get("is_admin", False)
-                )
-                balance_df["email"] = balance_df["account_label"].map(
-                    lambda a: _ba_map.get(a, {}).get("email") or "—"
-                )
+            balance_df = pd.DataFrame(summary_rows)
+            if balance_df.empty:
+                st.info("No primary accounts configured.")
+            else:
                 balance_df = balance_df.sort_values("balance", ascending=False).reset_index(drop=True)
-
-                # Metrics — non-admin only
                 non_admin = balance_df[~balance_df["is_admin"]]
+
+                # Metrics
                 if not non_admin.empty:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Total Outstanding", f"${non_admin['balance'].sum():,.2f}")
                     c2.metric("Total Collected", f"${non_admin['total_paid'].sum():,.2f}")
                     c3.metric("Total Owed", f"${non_admin['total_owed'].sum():,.2f}")
 
-                # Table
                 pfx = "📊 Filtered: " + ", ".join(month_filter) if month_filter else "📊 All Months"
                 st.caption(pfx)
 
                 disp = balance_df.copy()
-                disp["type"] = disp["is_admin"].map({True: "👑 Admin", False: "👤 Member"})
+                disp["type"] = disp["is_admin"].map({True: "👑 Admin", False: "👤 Primary"})
                 disp = disp.rename(columns={
-                    "account_label": "Account", "total_owed": "Total Owed",
+                    "account": "Account", "total_owed": "Total Owed",
                     "total_paid": "Total Paid", "balance": "Balance Due",
-                    "email": "Email", "type": "Type",
+                    "email": "Email", "type": "Type", "members": "Lines",
                 })
-                disp_cols = ["Account", "Type", "Total Owed", "Total Paid", "Balance Due", "Email"]
+                disp_cols = ["Account", "Type", "Lines", "Total Owed", "Total Paid", "Balance Due", "Email"]
 
                 def _color_bal(val):
                     if isinstance(val, (int, float)):
@@ -1984,109 +2120,110 @@ elif page == "Balances":
                 if not non_admin.empty:
                     fig = px.bar(
                         non_admin.sort_values("balance", ascending=True),
-                        x="balance", y="account_label", orientation="h",
+                        x="balance", y="account", orientation="h",
                         color="balance",
                         color_continuous_scale=["#00C853", "#FFB900", "#E20074"],
-                        title="Outstanding Balance by Account",
-                        labels={"balance": "Balance Due ($)", "account_label": "Account"},
+                        title="Outstanding Balance by Primary Account",
+                        labels={"balance": "Balance Due ($)", "account": "Account"},
                     )
-                    fig.update_layout(height=max(300, len(non_admin) * 50), showlegend=False)
+                    fig.update_layout(height=max(300, len(non_admin) * 60), showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
 
-                # ── Drill-down per account ─────────────────────────
+                # ── Drill-down per primary ─────────────────────────
                 st.subheader("Account Drill-down")
-                sel_acct_dd = st.selectbox(
-                    "Select account", balance_df["account_label"].tolist(), key="bal_acct_dd"
-                )
-                acct_phones = set(_am_df[_am_df["account_label"] == sel_acct_dd]["phone_number"].tolist())
-                acct_data = filtered[filtered["phone_number"].isin(acct_phones)].copy() if acct_phones else pd.DataFrame()
-                if not acct_data.empty:
-                    # Per-member totals
-                    st.markdown("**Members:**")
-                    mem_tot = acct_data.groupby(["person_label", "phone_number"]).agg(
-                        plan=("plan", "sum"), equipment=("equipment", "sum"),
-                        services=("services", "sum"), onetime=("onetime", "sum"),
-                        taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
-                        acct_share=("acct_share", "sum"), month_total=("month_total", "sum"),
-                    ).reset_index()
-                    mem_rel = _am_df[_am_df["account_label"] == sel_acct_dd][["phone_number", "relationship"]]
-                    mem_tot = mem_tot.merge(mem_rel, on="phone_number", how="left")
-                    mem_tot["relationship"] = mem_tot["relationship"].fillna("—")
-                    mem_disp = mem_tot.rename(columns={
-                        "person_label": "Name", "phone_number": "Phone",
-                        "relationship": "Relation", "plan": "Plan",
-                        "equipment": "Equipment", "services": "Services",
-                        "onetime": "One-Time", "taxes_fees": "Taxes & Fees",
-                        "line_total": "Line Total", "acct_share": "Acct Share",
-                        "month_total": "Month Total",
-                    })
-                    st.dataframe(
-                        mem_disp[["Name", "Phone", "Relation", "Plan", "Equipment", "Services",
-                                  "One-Time", "Taxes & Fees", "Line Total", "Acct Share", "Month Total"]].style.format({
-                            "Plan": "${:,.2f}", "Equipment": "${:,.2f}", "Services": "${:,.2f}",
-                            "One-Time": "${:,.2f}", "Taxes & Fees": "${:,.2f}", "Line Total": "${:,.2f}",
-                            "Acct Share": "${:,.2f}", "Month Total": "${:,.2f}",
-                        }),
-                        use_container_width=True, hide_index=True,
-                    )
+                dd_labels = [f"{r['account']} ({r['primary_phone']})" for _, r in balance_df.iterrows()]
+                sel_dd = st.selectbox("Select primary account", dd_labels, key="bal_acct_dd")
+                sel_dd_ph = sel_dd.split("(")[-1].rstrip(")") if sel_dd else ""
 
-                    # Per-month totals
-                    st.markdown("**Monthly Breakdown:**")
-                    mo_tot = acct_data.groupby(["month", "bill_date"]).agg(
-                        plan=("plan", "sum"), equipment=("equipment", "sum"),
-                        services=("services", "sum"), onetime=("onetime", "sum"),
-                        taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
-                        acct_share=("acct_share", "sum"), month_total=("month_total", "sum"),
-                    ).reset_index().sort_values("bill_date")
-                    # Merge settlements per month
-                    if not _stl_df.empty:
-                        stl_acct = _stl_df[_stl_df["account_label"] == sel_acct_dd]
-                        stl_mo = stl_acct.groupby("bill_month")["amount"].sum().reset_index().rename(
-                            columns={"amount": "paid", "bill_month": "month"}
+                if sel_dd_ph:
+                    family_ph = _get_family_phones(sel_dd_ph)
+                    fam_data = filtered[filtered["phone_number"].isin(family_ph)].copy()
+                    if not fam_data.empty:
+                        # Per-member totals
+                        st.markdown("**👥 Family Members:**")
+                        mem_tot = fam_data.groupby(["person_label", "phone_number"]).agg(
+                            plan=("plan", "sum"), equipment=("equipment", "sum"),
+                            services=("services", "sum"), onetime=("onetime", "sum"),
+                            taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
+                            acct_share=("acct_share", "sum"), month_total=("month_total", "sum"),
+                        ).reset_index()
+                        # Attach relationship
+                        mem_tot["relationship"] = mem_tot["phone_number"].map(
+                            lambda ph: _acct_map.get(ph, {}).get("relationship", "—")
                         )
-                        mo_tot = mo_tot.merge(stl_mo, on="month", how="left")
-                        mo_tot["paid"] = mo_tot["paid"].fillna(0)
+                        mem_disp = mem_tot.rename(columns={
+                            "person_label": "Name", "phone_number": "Phone",
+                            "relationship": "Relation", "plan": "Plan",
+                            "equipment": "Equipment", "services": "Services",
+                            "onetime": "One-Time", "taxes_fees": "Taxes & Fees",
+                            "line_total": "Line Total", "acct_share": "Acct Share",
+                            "month_total": "Month Total",
+                        })
+                        st.dataframe(
+                            mem_disp[["Name", "Phone", "Relation", "Plan", "Equipment",
+                                      "Services", "One-Time", "Taxes & Fees", "Line Total",
+                                      "Acct Share", "Month Total"]].style.format({
+                                "Plan": "${:,.2f}", "Equipment": "${:,.2f}",
+                                "Services": "${:,.2f}", "One-Time": "${:,.2f}",
+                                "Taxes & Fees": "${:,.2f}", "Line Total": "${:,.2f}",
+                                "Acct Share": "${:,.2f}", "Month Total": "${:,.2f}",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                        # Monthly breakdown
+                        st.markdown("**📅 Monthly Breakdown:**")
+                        mo_tot = fam_data.groupby(["month", "bill_date"]).agg(
+                            plan=("plan", "sum"), equipment=("equipment", "sum"),
+                            services=("services", "sum"), onetime=("onetime", "sum"),
+                            taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
+                            acct_share=("acct_share", "sum"), month_total=("month_total", "sum"),
+                        ).reset_index().sort_values("bill_date")
+                        if not _stl_df.empty:
+                            stl_dd = _stl_df[_stl_df["primary_phone"] == sel_dd_ph]
+                            stl_mo = stl_dd.groupby("bill_month")["amount"].sum().reset_index().rename(
+                                columns={"amount": "paid", "bill_month": "month"})
+                            mo_tot = mo_tot.merge(stl_mo, on="month", how="left")
+                            mo_tot["paid"] = mo_tot["paid"].fillna(0)
+                        else:
+                            mo_tot["paid"] = 0.0
+                        mo_tot["balance"] = (mo_tot["month_total"] - mo_tot["paid"]).round(2)
+                        mo_disp = mo_tot[["month", "plan", "equipment", "services", "onetime",
+                                          "taxes_fees", "line_total", "acct_share", "month_total",
+                                          "paid", "balance"]].rename(columns={
+                            "month": "Month", "plan": "Plan", "equipment": "Equipment",
+                            "services": "Services", "onetime": "One-Time",
+                            "taxes_fees": "Taxes & Fees", "line_total": "Line Total",
+                            "acct_share": "Acct Share", "month_total": "Month Total",
+                            "paid": "Paid", "balance": "Balance",
+                        })
+                        st.dataframe(
+                            mo_disp.style.format({
+                                "Plan": "${:,.2f}", "Equipment": "${:,.2f}",
+                                "Services": "${:,.2f}", "One-Time": "${:,.2f}",
+                                "Taxes & Fees": "${:,.2f}", "Line Total": "${:,.2f}",
+                                "Acct Share": "${:,.2f}", "Month Total": "${:,.2f}",
+                                "Paid": "${:,.2f}", "Balance": "${:,.2f}",
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
                     else:
-                        mo_tot["paid"] = 0.0
-                    mo_tot["balance"] = (mo_tot["month_total"] - mo_tot["paid"]).round(2)
-                    mo_disp = mo_tot[["month", "plan", "equipment", "services", "onetime",
-                                      "taxes_fees", "line_total", "acct_share", "month_total",
-                                      "paid", "balance"]].rename(columns={
-                        "month": "Month", "plan": "Plan", "equipment": "Equipment",
-                        "services": "Services", "onetime": "One-Time",
-                        "taxes_fees": "Taxes & Fees", "line_total": "Line Total",
-                        "acct_share": "Acct Share", "month_total": "Month Total",
-                        "paid": "Paid", "balance": "Balance",
-                    })
-                    st.dataframe(
-                        mo_disp.style.format({
-                            "Plan": "${:,.2f}", "Equipment": "${:,.2f}",
-                            "Services": "${:,.2f}", "One-Time": "${:,.2f}",
-                            "Taxes & Fees": "${:,.2f}", "Line Total": "${:,.2f}",
-                            "Acct Share": "${:,.2f}", "Month Total": "${:,.2f}",
-                            "Paid": "${:,.2f}", "Balance": "${:,.2f}",
-                        }),
-                        use_container_width=True, hide_index=True,
-                    )
-                else:
-                    if not acct_phones:
-                        st.info(f"No members mapped for **{sel_acct_dd}**. Add members in the Accounts tab.")
-                    else:
-                        st.info("No charge data for the selected months.")
+                        st.info("No charge data for the selected filters / account.")
 
     # ─────────────────────────────────────────────────────────────
     # TAB 3: Record Payment
     # ─────────────────────────────────────────────────────────────
     with tab_pay:
         st.subheader("Record a Payment")
-        st.caption("Log a payment received from an account toward their bill share.")
+        st.caption("Log a payment received from a primary account toward their family's bill share.")
 
-        acct_labels_pay = [a for a in _ba_df["account_label"].tolist()
-                           if not _ba_map.get(a, {}).get("is_admin", False)]
+        pay_primaries = [p for p in _primary_phones
+                         if not _acct_map[p].get("is_admin", False)]
+        pay_labels = [f"{_acct_map[p]['name']} ({p})" for p in pay_primaries]
 
         with st.form("record_payment", clear_on_submit=True):
             pc1, pc2 = st.columns(2)
-            pay_acct = pc1.selectbox("Account", acct_labels_pay, key="pay_acct_sel")
+            pay_sel = pc1.selectbox("Primary Account", pay_labels, key="pay_acct_sel") if pay_labels else ""
             pay_amount = pc2.number_input("Amount ($)", min_value=0.01, step=10.0, format="%.2f")
 
             pc3, pc4 = st.columns(2)
@@ -2098,18 +2235,20 @@ elif page == "Balances":
             pay_notes = pc6.text_input("Notes (optional)")
 
             submitted = st.form_submit_button("💾 Save Payment", type="primary")
-            if submitted and pay_acct and pay_amount > 0:
+            if submitted and pay_sel and pay_amount > 0:
+                pay_ph = pay_sel.split("(")[-1].rstrip(")") if pay_sel else ""
                 bill_month_val = None if pay_month == "— General —" else pay_month
                 recorder = st.session_state.get("user_email", "unknown")
                 con = get_con()
                 con.execute("""
-                    INSERT INTO settlements (settlement_id, account_label, bill_month,
+                    INSERT INTO settlements (settlement_id, primary_phone, bill_month,
                         amount, payment_date, payment_method, notes, recorded_by)
                     VALUES (nextval('seq_settlement'), ?, ?, ?, ?, ?, ?, ?)
-                """, [pay_acct, bill_month_val, pay_amount,
+                """, [pay_ph, bill_month_val, pay_amount,
                       str(pay_date), pay_method, pay_notes, recorder])
                 con.execute("CHECKPOINT")
-                st.success(f"✅ Recorded **${pay_amount:,.2f}** from **{pay_acct}** on {pay_date}.")
+                acct_name = _acct_map.get(pay_ph, {}).get("name", pay_ph)
+                st.success(f"✅ Recorded **${pay_amount:,.2f}** from **{acct_name}** on {pay_date}.")
                 st.rerun()
 
     # ─────────────────────────────────────────────────────────────
@@ -2120,8 +2259,12 @@ elif page == "Balances":
         if _stl_df.empty:
             st.info("No payments recorded yet.")
         else:
-            stl_disp = _stl_df.rename(columns={
-                "settlement_id": "ID", "account_label": "Account",
+            stl_disp = _stl_df.copy()
+            stl_disp["account"] = stl_disp["primary_phone"].map(
+                lambda p: _acct_map.get(p, {}).get("name", p)
+            )
+            stl_disp = stl_disp.rename(columns={
+                "settlement_id": "ID", "account": "Account",
                 "bill_month": "Bill Month", "amount": "Amount",
                 "payment_date": "Date", "payment_method": "Method",
                 "notes": "Notes", "recorded_by": "Recorded By",
@@ -2145,18 +2288,19 @@ elif page == "Balances":
                 st.rerun()
 
     # ─────────────────────────────────────────────────────────────
-    # TAB 5: Send Email — selective months, notes, per-account
+    # TAB 5: Send Email — selective months, per primary account
     # ─────────────────────────────────────────────────────────────
     with tab_email:
         st.subheader("Send Bill Email")
-        st.caption("Send a detailed bill email to an account for selected months with optional notes.")
+        st.caption("Send a detailed bill email to a primary account for selected months with optional notes.")
 
-        # Pick target account
-        emailable_accts = [a for a in _ba_df["account_label"].tolist() if _ba_map.get(a, {}).get("email")]
-        if not emailable_accts:
-            st.warning("No accounts with email addresses configured. Set emails in the Accounts tab.")
+        emailable = [p for p in _primary_phones if _acct_map[p].get("email")]
+        if not emailable:
+            st.warning("No primary accounts with email addresses. Set emails in Account Management.")
         else:
-            em_acct = st.selectbox("Send to Account", emailable_accts, key="em_acct_sel")
+            em_labels = [f"{_acct_map[p]['name']} ({p})" for p in emailable]
+            em_sel = st.selectbox("Send to", em_labels, key="em_acct_sel")
+            em_ph = em_sel.split("(")[-1].rstrip(")") if em_sel else ""
             em_months = st.multiselect("Select months to include", _all_months, key="em_months")
             em_notes = st.text_area("Personal note (included in the email)", height=80, key="em_notes",
                                     placeholder="e.g. Please pay by March 15th via Zelle to ...")
@@ -2164,49 +2308,41 @@ elif page == "Balances":
             if st.button("📧 Send Email", type="primary", key="em_send_btn"):
                 if not em_months:
                     st.warning("Select at least one month.")
-                else:
-                    # Build data for this account + selected months
-                    acct_phones_em = set(
-                        _am_df[_am_df["account_label"] == em_acct]["phone_number"].tolist()
-                    )
+                elif em_ph:
+                    family = _get_family_phones(em_ph)
                     em_data = bal_all[
-                        (bal_all["phone_number"].isin(acct_phones_em)) &
+                        (bal_all["phone_number"].isin(family)) &
                         (bal_all["month"].isin(em_months))
                     ].copy() if not bal_all.empty else pd.DataFrame()
 
                     if em_data.empty:
-                        st.warning(f"No bill data for **{em_acct}** in the selected months. Check member mapping.")
+                        st.warning("No bill data for this account in the selected months.")
                     else:
-                        # Per-month totals
-                        em_mo = em_data.groupby("month").agg(
-                            month_total=("month_total", "sum"),
-                        ).reset_index()
+                        em_name = _acct_map[em_ph]["name"]
+                        em_email = _acct_map[em_ph]["email"]
 
-                        # Settlements for those months
+                        # Per-month
+                        em_mo = em_data.groupby("month")["month_total"].sum().reset_index()
                         stl_em = _stl_df[
-                            (_stl_df["account_label"] == em_acct) &
+                            (_stl_df["primary_phone"] == em_ph) &
                             (_stl_df["bill_month"].isin(em_months))
                         ] if not _stl_df.empty else pd.DataFrame()
                         stl_em_sum = stl_em.groupby("bill_month")["amount"].sum().to_dict() if not stl_em.empty else {}
 
-                        # Per-member detail
-                        mem_detail = em_data.groupby(["person_label", "phone_number"]).agg(
-                            total=("month_total", "sum"),
-                        ).reset_index()
-                        mem_rel_em = _am_df[_am_df["account_label"] == em_acct][["phone_number", "relationship"]]
-                        mem_detail = mem_detail.merge(mem_rel_em, on="phone_number", how="left")
+                        # Per-member
+                        mem_detail = em_data.groupby(["person_label", "phone_number"])["month_total"].sum().reset_index()
+                        mem_detail["relationship"] = mem_detail["phone_number"].map(
+                            lambda ph: _acct_map.get(ph, {}).get("relationship", "—"))
 
                         # Build HTML
                         months_rows = ""
-                        grand_owed = 0
-                        grand_paid = 0
+                        grand_owed = grand_paid = 0
                         for _, mr in em_mo.iterrows():
                             m = mr["month"]
                             owed = mr["month_total"]
                             paid = stl_em_sum.get(m, 0)
                             bal = owed - paid
-                            grand_owed += owed
-                            grand_paid += paid
+                            grand_owed += owed; grand_paid += paid
                             bg = ' style="background:#FFF0F5"' if bal > 0 else ""
                             months_rows += f"""<tr{bg}>
                                 <td style="padding:6px;border:1px solid #ddd">{m}</td>
@@ -2218,20 +2354,21 @@ elif page == "Balances":
 
                         members_rows = ""
                         for _, md in mem_detail.iterrows():
-                            rel = md.get("relationship", "—") or "—"
                             members_rows += f"""<tr>
                                 <td style="padding:5px;border:1px solid #ddd">{md['person_label']}</td>
                                 <td style="padding:5px;border:1px solid #ddd">{md['phone_number']}</td>
-                                <td style="padding:5px;border:1px solid #ddd">{rel}</td>
-                                <td style="padding:5px;border:1px solid #ddd;text-align:right">${md['total']:,.2f}</td>
+                                <td style="padding:5px;border:1px solid #ddd">{md['relationship']}</td>
+                                <td style="padding:5px;border:1px solid #ddd;text-align:right">${md['month_total']:,.2f}</td>
                             </tr>"""
 
-                        notes_html = f'<div style="background:#FFFDE7;padding:12px;border-left:4px solid #FFB900;margin:16px 0"><strong>Note:</strong> {em_notes}</div>' if em_notes.strip() else ""
+                        notes_html = (f'<div style="background:#FFFDE7;padding:12px;border-left:4px solid #FFB900;'
+                                      f'margin:16px 0"><strong>Note:</strong> {em_notes}</div>'
+                                      if em_notes.strip() else "")
 
                         html_body = f"""
                         <div style="font-family:Arial,sans-serif;max-width:650px;margin:auto">
                           <h2 style="color:#E20074">T-Mobile Bill Summary</h2>
-                          <p>Hi <strong>{em_acct}</strong>,</p>
+                          <p>Hi <strong>{em_name}</strong>,</p>
                           <p>Here is your T-Mobile bill share for <strong>{', '.join(em_months)}</strong>:</p>
                           {notes_html}
                           <h3 style="color:#333">Monthly Breakdown</h3>
@@ -2264,44 +2401,45 @@ elif page == "Balances":
                           <p style="color:#888;font-size:12px">Sent from <a href="{_APP_URL}">T-Mobile Bill Tracker</a></p>
                         </div>"""
 
-                        to_email = _ba_map[em_acct]["email"]
-                        subject = f"T-Mobile Bill – {', '.join(em_months)}"
-                        ok, msg = _send_sg_email(to_email, em_acct, subject, html_body)
+                        ok, msg = _send_sg_email(em_email, em_name,
+                                                 f"T-Mobile Bill – {', '.join(em_months)}", html_body)
                         if ok:
-                            st.success(f"✅ Email sent to **{em_acct}** ({to_email})")
+                            st.success(f"✅ Email sent to **{em_name}** ({em_email})")
                         else:
                             st.error(f"❌ {msg}")
 
-            # ── Send master summary to admin ──────────────────────
+            # ── Master summary to admin ───────────────────────────
             st.divider()
             st.subheader("Send Master Summary to Admin")
-            admin_email = _ba_map.get(_ADMIN_LABEL, {}).get("email", "")
+            admin_email = _acct_map.get(_admin_phone, {}).get("email", "") if _admin_phone else ""
             if admin_email and _all_months:
                 ms_months = st.multiselect("Months for summary", _all_months, key="ms_months")
                 if st.button(f"📧 Send Master Summary to {_ADMIN_LABEL}", key="ms_send"):
                     if not ms_months:
                         st.warning("Select at least one month.")
                     else:
-                        mapped_ms = bal_all[bal_all["account_label"].notna()].copy()
-                        mapped_ms = mapped_ms[mapped_ms["month"].isin(ms_months)]
-                        if mapped_ms.empty:
-                            st.warning("No mapped data for those months.")
+                        ms_filtered = bal_all[bal_all["month"].isin(ms_months)] if not bal_all.empty else pd.DataFrame()
+                        if ms_filtered.empty:
+                            st.warning("No data for those months.")
                         else:
-                            acct_summary = mapped_ms.groupby("account_label")["month_total"].sum().reset_index()
-                            acct_summary.columns = ["Account", "Owed"]
-                            # Settlements
-                            if not _stl_df.empty:
-                                stl_ms = _stl_df[_stl_df["bill_month"].isin(ms_months) | _stl_df["bill_month"].isna()]
-                                paid_ms = stl_ms.groupby("account_label")["amount"].sum().reset_index()
-                                paid_ms.columns = ["Account", "Paid"]
-                                acct_summary = acct_summary.merge(paid_ms, on="Account", how="left")
-                            else:
-                                acct_summary["Paid"] = 0
-                            acct_summary["Paid"] = acct_summary["Paid"].fillna(0)
-                            acct_summary["Balance"] = (acct_summary["Owed"] - acct_summary["Paid"]).round(2)
-
+                            rows_data = []
+                            for pp in _primary_phones:
+                                fam = _get_family_phones(pp)
+                                fam_d = ms_filtered[ms_filtered["phone_number"].isin(fam)]
+                                owed = float(fam_d["month_total"].sum()) if not fam_d.empty else 0
+                                paid = 0
+                                if not _stl_df.empty:
+                                    sp = _stl_df[(_stl_df["primary_phone"] == pp) &
+                                                 (_stl_df["bill_month"].isin(ms_months) | _stl_df["bill_month"].isna())]
+                                    paid = float(sp["amount"].sum())
+                                rows_data.append({
+                                    "Account": _acct_map[pp]["name"],
+                                    "Owed": round(owed, 2), "Paid": round(paid, 2),
+                                    "Balance": round(owed - paid, 2),
+                                })
+                            ms_df = pd.DataFrame(rows_data)
                             rows_h = ""
-                            for _, sr in acct_summary.iterrows():
+                            for _, sr in ms_df.iterrows():
                                 bg = ' style="background:#FFF0F5"' if sr["Balance"] > 0 else ""
                                 rows_h += f"""<tr{bg}>
                                     <td style="padding:6px;border:1px solid #ddd">{sr['Account']}</td>
@@ -2324,20 +2462,21 @@ elif page == "Balances":
                                 {rows_h}
                                 <tr style="background:#333;color:white">
                                   <td style="padding:8px;border:1px solid #ddd"><strong>TOTAL</strong></td>
-                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${acct_summary['Owed'].sum():,.2f}</strong></td>
-                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${acct_summary['Paid'].sum():,.2f}</strong></td>
-                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${acct_summary['Balance'].sum():,.2f}</strong></td>
+                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${ms_df['Owed'].sum():,.2f}</strong></td>
+                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${ms_df['Paid'].sum():,.2f}</strong></td>
+                                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${ms_df['Balance'].sum():,.2f}</strong></td>
                                 </tr>
                               </table>
                               <p style="margin-top:16px"><a href="{_APP_URL}">Open Dashboard →</a></p>
                             </div>"""
-                            ok, msg = _send_sg_email(admin_email, _ADMIN_LABEL, f"T-Mobile Master Summary – {', '.join(ms_months)}", ms_html)
+                            ok, msg = _send_sg_email(admin_email, _ADMIN_LABEL,
+                                                     f"T-Mobile Master Summary – {', '.join(ms_months)}", ms_html)
                             if ok:
                                 st.success(f"✅ Master summary sent to {admin_email}")
                             else:
                                 st.error(f"❌ {msg}")
             elif not admin_email:
-                st.info(f"Set an email for **{_ADMIN_LABEL}** in the Accounts tab to enable this.")
+                st.info(f"Set an email for **{_ADMIN_LABEL}** in Account Management to enable this.")
 
 
 # ════════════════════════════════════════════════════════════════════

@@ -124,27 +124,24 @@ CREATE TABLE IF NOT EXISTS phone_names (
     phone_number  VARCHAR PRIMARY KEY,
     person_name   VARCHAR NOT NULL
 );
-CREATE TABLE IF NOT EXISTS billing_accounts (
-    account_label   VARCHAR PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS accounts (
+    phone_number    VARCHAR PRIMARY KEY,
+    account_name    VARCHAR NOT NULL,
+    account_type    VARCHAR NOT NULL DEFAULT 'Individual',
+    primary_phone   VARCHAR,
+    relationship    VARCHAR DEFAULT 'Self',
     contact_email   VARCHAR,
     is_admin        BOOLEAN DEFAULT FALSE
 );
-CREATE TABLE IF NOT EXISTS account_members (
-    account_label   VARCHAR NOT NULL,
-    person_label    VARCHAR NOT NULL,
-    phone_number    VARCHAR NOT NULL,
-    relationship    VARCHAR DEFAULT 'Self',
-    PRIMARY KEY (account_label, phone_number)
-);
 CREATE TABLE IF NOT EXISTS settlements (
-    settlement_id  INTEGER PRIMARY KEY,
-    account_label  VARCHAR NOT NULL,
-    bill_month     VARCHAR,
-    amount         DECIMAL(10,2) NOT NULL,
-    payment_date   DATE NOT NULL,
-    payment_method VARCHAR,
-    notes          VARCHAR,
-    recorded_by    VARCHAR
+    settlement_id   INTEGER PRIMARY KEY,
+    primary_phone   VARCHAR NOT NULL,
+    bill_month      VARCHAR,
+    amount          DECIMAL(10,2) NOT NULL,
+    payment_date    DATE NOT NULL,
+    payment_method  VARCHAR,
+    notes           VARCHAR,
+    recorded_by     VARCHAR
 );
 CREATE SEQUENCE IF NOT EXISTS seq_settlement START 1;
 CREATE OR REPLACE VIEW person_monthly_cost AS
