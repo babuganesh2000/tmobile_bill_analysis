@@ -1828,10 +1828,10 @@ elif page == "Balances":
 
                     # Remove a child
                     if children:
-                        ch_opts = [f"{ch['account_name']} ({ch['phone_number']})" for ch in children]
+                        _ch_map = {f"{ch['account_name']} ({ch['phone_number']})": ch['phone_number'] for ch in children}
                         rc1, rc2, rc3 = st.columns([3, 1, 1])
-                        sel_ch = rc1.selectbox("Select child", ch_opts, key=f"rc_{pp}")
-                        sel_ch_phone = sel_ch.split("(")[-1].rstrip(")") if sel_ch else ""
+                        sel_ch = rc1.selectbox("Select child", list(_ch_map.keys()), key=f"rc_{pp}")
+                        sel_ch_phone = _ch_map.get(sel_ch, "") if sel_ch else ""
                         if rc2.button("🔓 Unlink", key=f"unlink_{pp}",
                                       help="Convert to Individual (keeps account)"):
                             get_con().execute(
@@ -1874,17 +1874,21 @@ elif page == "Balances":
         # ── Create Primary Account ──────────────────────────────
         st.subheader("➕ Create Primary Account")
         # Eligible: unassigned phones + individual accounts
-        _eligible_primary = []
+        _eligible_primary = {}  # display_label → phone_number
         for _, r in _unassigned_df.iterrows():
-            _eligible_primary.append(f"{r['phone_number']}  ({_name_map_bal.get(r['phone_number'], '?')}, {r['line_type']})")
+            _pname = _name_map_bal.get(r['phone_number'], '')
+            if _pname and _pname != r['phone_number']:
+                _eligible_primary[f"{_pname}  ({r['phone_number']}, {r['line_type']})"] = r['phone_number']
+            else:
+                _eligible_primary[f"{r['phone_number']}  ({r['line_type']})"] = r['phone_number']
         for _, r in indiv_df.iterrows():
-            _eligible_primary.append(f"{r['phone_number']}  ({r['account_name']}, Individual)")
+            _eligible_primary[f"{r['account_name']}  ({r['phone_number']}, Individual)"] = r['phone_number']
 
         with st.form("create_primary", clear_on_submit=True):
             cp1, cp2 = st.columns(2)
             if _eligible_primary:
-                cp_phone_disp = cp1.selectbox("Phone Line", _eligible_primary, key="cp_phone")
-                cp_phone = cp_phone_disp.split("  (")[0] if cp_phone_disp else ""
+                cp_phone_disp = cp1.selectbox("Phone Line", list(_eligible_primary.keys()), key="cp_phone")
+                cp_phone = _eligible_primary.get(cp_phone_disp, "") if cp_phone_disp else ""
             else:
                 cp1.info("No unassigned lines available.")
                 cp_phone = ""
@@ -1912,21 +1916,23 @@ elif page == "Balances":
         st.subheader("👶 Add Child Account to a Primary")
 
         # Eligible for child: unassigned + individual (not already primary with children)
-        _eligible_child = []
+        _eligible_child = {}  # display_label → phone_number
         for _, r in _unassigned_df.iterrows():
-            _eligible_child.append(f"{r['phone_number']}  ({_name_map_bal.get(r['phone_number'], '?')}, {r['line_type']})")
+            _pname = _name_map_bal.get(r['phone_number'], '')
+            if _pname and _pname != r['phone_number']:
+                _eligible_child[f"{_pname}  ({r['phone_number']}, {r['line_type']})"] = r['phone_number']
+            else:
+                _eligible_child[f"{r['phone_number']}  ({r['line_type']})"] = r['phone_number']
         for _, r in indiv_df.iterrows():
-            _eligible_child.append(f"{r['phone_number']}  ({r['account_name']}, Individual)")
+            _eligible_child[f"{r['account_name']}  ({r['phone_number']}, Individual)"] = r['phone_number']
 
-        _primary_labels = [
-            f"{_acct_map[p]['name']} ({p})" for p in _primary_phones
-        ]
+        _primary_map = {f"{_acct_map[p]['name']} ({p})": p for p in _primary_phones}
 
         with st.form("add_child", clear_on_submit=True):
             ac1, ac2 = st.columns(2)
-            if _primary_labels:
-                sel_primary_disp = ac1.selectbox("Parent Primary", _primary_labels, key="ac_parent")
-                sel_primary_ph = sel_primary_disp.split("(")[-1].rstrip(")") if sel_primary_disp else ""
+            if _primary_map:
+                sel_primary_disp = ac1.selectbox("Parent Primary", list(_primary_map.keys()), key="ac_parent")
+                sel_primary_ph = _primary_map.get(sel_primary_disp, "") if sel_primary_disp else ""
             else:
                 ac1.warning("Create a Primary account first.")
                 sel_primary_ph = ""
@@ -1937,8 +1943,8 @@ elif page == "Balances":
             ], key="ac_rel")
 
             if _eligible_child:
-                sel_child_disp = st.selectbox("Phone Line", _eligible_child, key="ac_child_phone")
-                sel_child_ph = sel_child_disp.split("  (")[0] if sel_child_disp else ""
+                sel_child_disp = st.selectbox("Phone Line", list(_eligible_child.keys()), key="ac_child_phone")
+                sel_child_ph = _eligible_child.get(sel_child_disp, "") if sel_child_disp else ""
             else:
                 st.info("No unassigned/individual lines available to add.")
                 sel_child_ph = ""
@@ -1967,13 +1973,14 @@ elif page == "Balances":
             st.subheader("🔄 Reassign Child to Different Primary")
             with st.form("reassign_child", clear_on_submit=False):
                 ra1, ra2 = st.columns(2)
-                ch_labels = [
-                    f"{r['account_name']} ({r['phone_number']})" for _, r in all_children.iterrows()
-                ]
-                sel_reassign = ra1.selectbox("Child to reassign", ch_labels, key="ra_child")
-                sel_new_parent_disp = ra2.selectbox("New Primary", _primary_labels, key="ra_newparent")
-                sel_ra_ph = sel_reassign.split("(")[-1].rstrip(")") if sel_reassign else ""
-                sel_new_pp = sel_new_parent_disp.split("(")[-1].rstrip(")") if sel_new_parent_disp else ""
+                _child_map = {
+                    f"{r['account_name']} ({r['phone_number']})": r['phone_number']
+                    for _, r in all_children.iterrows()
+                }
+                sel_reassign = ra1.selectbox("Child to reassign", list(_child_map.keys()), key="ra_child")
+                sel_new_parent_disp = ra2.selectbox("New Primary", list(_primary_map.keys()), key="ra_newparent")
+                sel_ra_ph = _child_map.get(sel_reassign, "") if sel_reassign else ""
+                sel_new_pp = _primary_map.get(sel_new_parent_disp, "") if sel_new_parent_disp else ""
 
                 if st.form_submit_button("🔄 Reassign", type="primary"):
                     if sel_ra_ph and sel_new_pp:
@@ -1988,12 +1995,13 @@ elif page == "Balances":
         # ── Edit Account Details ────────────────────────────────
         st.divider()
         st.subheader("✏️ Edit Account Details")
-        _all_acct_labels = [
-            f"{r['account_name']} ({r['phone_number']})" for _, r in _accts_df.iterrows()
-        ]
-        if _all_acct_labels:
-            sel_edit_disp = st.selectbox("Select account to edit", _all_acct_labels, key="edit_sel")
-            sel_edit_ph = sel_edit_disp.split("(")[-1].rstrip(")") if sel_edit_disp else ""
+        _all_acct_map = {
+            f"{r['account_name']} ({r['phone_number']})": r['phone_number']
+            for _, r in _accts_df.iterrows()
+        }
+        if _all_acct_map:
+            sel_edit_disp = st.selectbox("Select account to edit", list(_all_acct_map.keys()), key="edit_sel")
+            sel_edit_ph = _all_acct_map.get(sel_edit_disp, "") if sel_edit_disp else ""
             if sel_edit_ph and sel_edit_ph in _acct_map:
                 cur = _acct_map[sel_edit_ph]
                 with st.form("edit_account", clear_on_submit=False):
@@ -2016,9 +2024,9 @@ elif page == "Balances":
             st.divider()
             st.subheader("🗑️ Delete Primary Account")
             st.caption("Deleting a primary converts all its children to Individual.")
-            del_labels = [f"{_acct_map[p]['name']} ({p})" for p in non_admin_primaries]
-            del_sel = st.selectbox("Primary to delete", del_labels, key="del_prim_sel")
-            del_ph = del_sel.split("(")[-1].rstrip(")") if del_sel else ""
+            _del_map = {f"{_acct_map[p]['name']} ({p})": p for p in non_admin_primaries}
+            del_sel = st.selectbox("Primary to delete", list(_del_map.keys()), key="del_prim_sel")
+            del_ph = _del_map.get(del_sel, "") if del_sel else ""
             if st.button("🗑️ Delete Primary", key="del_prim_btn"):
                 con = get_con()
                 # Convert children to Individual
@@ -2131,9 +2139,9 @@ elif page == "Balances":
 
                 # ── Drill-down per primary ─────────────────────────
                 st.subheader("Account Drill-down")
-                dd_labels = [f"{r['account']} ({r['primary_phone']})" for _, r in balance_df.iterrows()]
-                sel_dd = st.selectbox("Select primary account", dd_labels, key="bal_acct_dd")
-                sel_dd_ph = sel_dd.split("(")[-1].rstrip(")") if sel_dd else ""
+                _dd_map = {f"{r['account']} ({r['primary_phone']})": r['primary_phone'] for _, r in balance_df.iterrows()}
+                sel_dd = st.selectbox("Select primary account", list(_dd_map.keys()), key="bal_acct_dd")
+                sel_dd_ph = _dd_map.get(sel_dd, "") if sel_dd else ""
 
                 if sel_dd_ph:
                     family_ph = _get_family_phones(sel_dd_ph)
@@ -2219,11 +2227,11 @@ elif page == "Balances":
 
         pay_primaries = [p for p in _primary_phones
                          if not _acct_map[p].get("is_admin", False)]
-        pay_labels = [f"{_acct_map[p]['name']} ({p})" for p in pay_primaries]
+        _pay_map = {f"{_acct_map[p]['name']} ({p})": p for p in pay_primaries}
 
         with st.form("record_payment", clear_on_submit=True):
             pc1, pc2 = st.columns(2)
-            pay_sel = pc1.selectbox("Primary Account", pay_labels, key="pay_acct_sel") if pay_labels else ""
+            pay_sel = pc1.selectbox("Primary Account", list(_pay_map.keys()), key="pay_acct_sel") if _pay_map else ""
             pay_amount = pc2.number_input("Amount ($)", min_value=0.01, step=10.0, format="%.2f")
 
             pc3, pc4 = st.columns(2)
@@ -2236,7 +2244,7 @@ elif page == "Balances":
 
             submitted = st.form_submit_button("💾 Save Payment", type="primary")
             if submitted and pay_sel and pay_amount > 0:
-                pay_ph = pay_sel.split("(")[-1].rstrip(")") if pay_sel else ""
+                pay_ph = _pay_map.get(pay_sel, "") if pay_sel else ""
                 bill_month_val = None if pay_month == "— General —" else pay_month
                 recorder = st.session_state.get("user_email", "unknown")
                 con = get_con()
@@ -2298,9 +2306,9 @@ elif page == "Balances":
         if not emailable:
             st.warning("No primary accounts with email addresses. Set emails in Account Management.")
         else:
-            em_labels = [f"{_acct_map[p]['name']} ({p})" for p in emailable]
-            em_sel = st.selectbox("Send to", em_labels, key="em_acct_sel")
-            em_ph = em_sel.split("(")[-1].rstrip(")") if em_sel else ""
+            _em_map = {f"{_acct_map[p]['name']} ({p})": p for p in emailable}
+            em_sel = st.selectbox("Send to", list(_em_map.keys()), key="em_acct_sel")
+            em_ph = _em_map.get(em_sel, "") if em_sel else ""
             em_months = st.multiselect("Select months to include", _all_months, key="em_months")
             em_notes = st.text_area("Personal note (included in the email)", height=80, key="em_notes",
                                     placeholder="e.g. Please pay by March 15th via Zelle to ...")
