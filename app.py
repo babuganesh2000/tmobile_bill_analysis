@@ -331,7 +331,7 @@ _nav_items += ["Savings & Discounts", "Raw Data Explorer"]
 # Admin (admin only)
 if _is_admin:
     _nav_items.append(f"{_SEPARATOR}⚙️  ADMIN")
-    _nav_items += ["User Management", "Phone Directory"]
+    _nav_items += ["Balances", "User Management", "Phone Directory"]
 
 # Render navigation — section headers are styled labels, pages are radio items
 # We use a callback-driven approach with buttons for headers, radio for pages
@@ -1683,6 +1683,451 @@ elif page == "User Management":
                 st.rerun()
         else:
             st.info("No removable users. Permanent admins cannot be removed.")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PAGE: Balances (admin only)
+# ════════════════════════════════════════════════════════════════════
+
+elif page == "Balances":
+    st.title("💰 Balances & Settlements")
+
+    if st.session_state.get("user_role") != "admin":
+        st.error("Admin access required.")
+        st.stop()
+
+    import requests as _requests
+    from datetime import date as _date, datetime as _datetime
+
+    _ACCT_HOLDER = "Sathish"
+    _APP_URL = "https://tmobilebillanalysis-w8t9cas3jwk6u4cc6qqwea.streamlit.app"
+
+    # ── helper: send email via SendGrid ────────────────────────────
+    def _send_sg_email(to_email: str, to_name: str, subject: str, html: str):
+        """Send an email via SendGrid v3 API.  Returns (ok, message)."""
+        sg = st.secrets.get("sendgrid", {})
+        api_key = sg.get("api_key", "")
+        from_email = sg.get("from_email", "")
+        if not api_key or "YOUR_" in api_key:
+            return False, "SendGrid API key not configured in secrets."
+        if not from_email:
+            return False, "Sender email not configured in secrets."
+        resp = _requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "personalizations": [{"to": [{"email": to_email, "name": to_name}]}],
+                "from": {"email": from_email, "name": "T-Mobile Bill Tracker"},
+                "subject": subject,
+                "content": [{"type": "text/html", "value": html}],
+            },
+            timeout=15,
+        )
+        if resp.status_code in (200, 201, 202):
+            return True, "Sent"
+        return False, f"SendGrid error {resp.status_code}: {resp.text[:200]}"
+
+    # ── Compute total owed per person across ALL months ────────────
+    _name_map_bal = (
+        persons.drop_duplicates("phone_number")
+        .set_index("phone_number")["person_label"].to_dict()
+    )
+    bal_rows = []
+    for bd in line_charges["bill_date"].unique():
+        lc_m = line_charges[line_charges["bill_date"] == bd]
+        sp = _build_month_splitup(lc_m)
+        sp["bill_date"] = bd
+        sp["month"] = pd.Timestamp(bd).strftime("%b %Y")
+        bal_rows.append(sp)
+    bal_all = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame()
+
+    if not bal_all.empty:
+        pm_map = person_monthly[["phone_number", "bill_date", "person_label"]].drop_duplicates()
+        bal_all = bal_all.merge(pm_map, on=["phone_number", "bill_date"], how="left")
+        bal_all["person_label"] = bal_all["person_label"].fillna(
+            bal_all["phone_number"].map(_name_map_bal)
+        ).fillna(bal_all["phone_number"])
+
+    # Aggregate per person (exclude account holder)
+    if not bal_all.empty:
+        person_owed = (
+            bal_all[bal_all["person_label"] != _ACCT_HOLDER]
+            .groupby("person_label")["month_total"].sum()
+            .reset_index()
+            .rename(columns={"month_total": "total_owed"})
+        )
+    else:
+        person_owed = pd.DataFrame(columns=["person_label", "total_owed"])
+
+    # ── Query settlements ──────────────────────────────────────────
+    stl = run_query("SELECT * FROM settlements ORDER BY payment_date DESC")
+    if not stl.empty:
+        person_paid = (
+            stl.groupby("person_label")["amount"].sum()
+            .reset_index()
+            .rename(columns={"amount": "total_paid"})
+        )
+    else:
+        person_paid = pd.DataFrame(columns=["person_label", "total_paid"])
+
+    # ── Merge into balance table ───────────────────────────────────
+    balance_df = person_owed.merge(person_paid, on="person_label", how="left")
+    balance_df["total_paid"] = balance_df["total_paid"].fillna(0).infer_objects(copy=False)
+    balance_df["balance"] = (balance_df["total_owed"] - balance_df["total_paid"]).round(2)
+    balance_df = balance_df.sort_values("balance", ascending=False).reset_index(drop=True)
+
+    # ── Query person emails ────────────────────────────────────────
+    pe_df = run_query("SELECT * FROM person_emails")
+    email_map = dict(zip(pe_df["person_label"], pe_df["email"])) if not pe_df.empty else {}
+
+    # ── Monthly detail per person (for drill-down) ─────────────────
+    if not bal_all.empty:
+        monthly_person = (
+            bal_all[bal_all["person_label"] != _ACCT_HOLDER]
+            .groupby(["person_label", "month", "bill_date"])
+            .agg(plan=("plan", "sum"), equipment=("equipment", "sum"),
+                 services=("services", "sum"), onetime=("onetime", "sum"),
+                 taxes_fees=("taxes_fees", "sum"), line_total=("line_total", "sum"),
+                 acct_share=("acct_share", "sum"), month_total=("month_total", "sum"))
+            .reset_index()
+            .sort_values(["person_label", "bill_date"])
+        )
+    else:
+        monthly_person = pd.DataFrame()
+
+    # ━━━━ TABS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    tab_summary, tab_pay, tab_history, tab_email = st.tabs(
+        ["📊 Balance Summary", "💵 Record Payment", "📜 Payment History", "✉️ Email & Reminders"]
+    )
+
+    # ─────────────────────────────────────────────────────────────
+    # TAB 1: Balance Summary
+    # ─────────────────────────────────────────────────────────────
+    with tab_summary:
+        st.subheader("Who Owes What")
+        st.caption(f"Account holder: **{_ACCT_HOLDER}** — everyone else owes their share to him.")
+
+        if balance_df.empty:
+            st.info("No balance data.")
+        else:
+            # Colour-coded metrics row
+            total_outstanding = balance_df["balance"].sum()
+            total_collected = balance_df["total_paid"].sum()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Outstanding", f"${total_outstanding:,.2f}")
+            c2.metric("Total Collected", f"${total_collected:,.2f}")
+            c3.metric("Total Owed (All Time)", f"${balance_df['total_owed'].sum():,.2f}")
+
+            # Summary table
+            disp = balance_df.copy()
+            disp["email"] = disp["person_label"].map(email_map).fillna("—")
+            disp = disp.rename(columns={
+                "person_label": "Person", "total_owed": "Total Owed",
+                "total_paid": "Total Paid", "balance": "Balance Due",
+                "email": "Email",
+            })
+            disp = disp[["Person", "Total Owed", "Total Paid", "Balance Due", "Email"]]
+
+            def _color_balance(val):
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        return "color: #E20074; font-weight: bold"
+                    elif val == 0:
+                        return "color: #00C853; font-weight: bold"
+                return ""
+
+            styled = disp.style.applymap(_color_balance, subset=["Balance Due"]).format(
+                {"Total Owed": "${:,.2f}", "Total Paid": "${:,.2f}", "Balance Due": "${:,.2f}"}
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # Bar chart
+            fig = px.bar(
+                balance_df.sort_values("balance", ascending=True),
+                x="balance", y="person_label", orientation="h",
+                color="balance",
+                color_continuous_scale=["#00C853", "#FFB900", "#E20074"],
+                title="Outstanding Balance by Person",
+                labels={"balance": "Balance Due ($)", "person_label": "Person"},
+            )
+            fig.update_layout(height=max(350, len(balance_df) * 40), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Monthly drill-down per person ──────────────────────
+            st.subheader("Monthly Drill-down")
+            sel_person = st.selectbox(
+                "Select person", balance_df["person_label"].tolist(), key="bal_drill_person"
+            )
+            if not monthly_person.empty:
+                mp = monthly_person[monthly_person["person_label"] == sel_person].copy()
+                if not mp.empty:
+                    # Month-by-month settlements
+                    if not stl.empty:
+                        stl_person = stl[stl["person_label"] == sel_person]
+                        stl_by_month = (
+                            stl_person.groupby("bill_month")["amount"].sum()
+                            .reset_index()
+                            .rename(columns={"amount": "paid"})
+                        )
+                        mp = mp.merge(stl_by_month, left_on="month", right_on="bill_month", how="left")
+                        mp["paid"] = mp["paid"].fillna(0)
+                        mp.drop(columns=["bill_month"], errors="ignore", inplace=True)
+                    else:
+                        mp["paid"] = 0.0
+                    mp["month_balance"] = (mp["month_total"] - mp["paid"]).round(2)
+
+                    mp_disp = mp[["month", "plan", "equipment", "services", "onetime",
+                                  "taxes_fees", "line_total", "acct_share", "month_total",
+                                  "paid", "month_balance"]].rename(columns={
+                        "month": "Month", "plan": "Plan", "equipment": "Equipment",
+                        "services": "Services", "onetime": "One-Time",
+                        "taxes_fees": "Taxes & Fees", "line_total": "Line Total",
+                        "acct_share": "Acct Share", "month_total": "Month Total",
+                        "paid": "Paid", "month_balance": "Balance",
+                    })
+                    st.dataframe(
+                        mp_disp.style.format({
+                            "Plan": "${:,.2f}", "Equipment": "${:,.2f}",
+                            "Services": "${:,.2f}", "One-Time": "${:,.2f}",
+                            "Taxes & Fees": "${:,.2f}", "Line Total": "${:,.2f}",
+                            "Acct Share": "${:,.2f}", "Month Total": "${:,.2f}",
+                            "Paid": "${:,.2f}", "Balance": "${:,.2f}",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.info(f"No monthly detail for {sel_person}.")
+
+    # ─────────────────────────────────────────────────────────────
+    # TAB 2: Record Payment
+    # ─────────────────────────────────────────────────────────────
+    with tab_pay:
+        st.subheader("Record a Payment")
+        st.caption("Log a payment received from a member toward their bill share.")
+
+        payer_list = balance_df["person_label"].tolist() if not balance_df.empty else []
+        month_list = sorted(bal_all["month"].unique().tolist(), reverse=True) if not bal_all.empty else []
+
+        with st.form("record_payment", clear_on_submit=True):
+            pc1, pc2 = st.columns(2)
+            pay_person = pc1.selectbox("Person", payer_list, key="pay_person_sel")
+            pay_amount = pc2.number_input("Amount ($)", min_value=0.01, step=10.0, format="%.2f")
+
+            pc3, pc4 = st.columns(2)
+            pay_date = pc3.date_input("Payment Date", value=_date.today())
+            pay_month = pc4.selectbox("For Bill Month (optional)", ["— General —"] + month_list)
+
+            pc5, pc6 = st.columns(2)
+            pay_method = pc5.selectbox("Method", ["Zelle", "Cash", "Venmo", "Check", "Other"])
+            pay_notes = pc6.text_input("Notes (optional)")
+
+            submitted = st.form_submit_button("💾 Save Payment", type="primary")
+            if submitted and pay_person and pay_amount > 0:
+                bill_month_val = None if pay_month == "— General —" else pay_month
+                recorder = st.session_state.get("user_email", "unknown")
+                con = get_con()
+                con.execute("""
+                    INSERT INTO settlements (settlement_id, person_label, bill_month,
+                        amount, payment_date, payment_method, notes, recorded_by)
+                    VALUES (nextval('seq_settlement'), ?, ?, ?, ?, ?, ?, ?)
+                """, [pay_person, bill_month_val, pay_amount,
+                      str(pay_date), pay_method, pay_notes, recorder])
+                con.execute("CHECKPOINT")
+                st.success(f"✅ Recorded **${pay_amount:,.2f}** from **{pay_person}** on {pay_date}.")
+                st.rerun()
+
+    # ─────────────────────────────────────────────────────────────
+    # TAB 3: Payment History
+    # ─────────────────────────────────────────────────────────────
+    with tab_history:
+        st.subheader("Payment History")
+        if stl.empty:
+            st.info("No payments recorded yet.")
+        else:
+            stl_disp = stl.rename(columns={
+                "settlement_id": "ID", "person_label": "Person",
+                "bill_month": "Bill Month", "amount": "Amount",
+                "payment_date": "Date", "payment_method": "Method",
+                "notes": "Notes", "recorded_by": "Recorded By",
+            })
+            stl_disp = stl_disp[["ID", "Person", "Bill Month", "Amount",
+                                  "Date", "Method", "Notes", "Recorded By"]]
+            stl_disp["Bill Month"] = stl_disp["Bill Month"].fillna("General")
+            st.dataframe(
+                stl_disp.style.format({"Amount": "${:,.2f}"}),
+                use_container_width=True, hide_index=True,
+            )
+
+            # Delete a payment
+            st.markdown("---")
+            st.subheader("Delete a Payment")
+            del_ids = stl["settlement_id"].tolist()
+            del_id = st.selectbox("Settlement ID to delete", del_ids, key="del_stl")
+            if st.button("🗑️ Delete", key="del_stl_btn"):
+                get_con().execute("DELETE FROM settlements WHERE settlement_id = ?", [del_id])
+                get_con().execute("CHECKPOINT")
+                st.success(f"Deleted settlement #{del_id}.")
+                st.rerun()
+
+    # ─────────────────────────────────────────────────────────────
+    # TAB 4: Email & Reminders
+    # ─────────────────────────────────────────────────────────────
+    with tab_email:
+        st.subheader("Manage Emails")
+        st.caption("Set email addresses for each person. Sathish always receives the master summary.")
+
+        all_persons = sorted(
+            person_owed["person_label"].tolist() + [_ACCT_HOLDER]
+        )
+        with st.form("manage_emails", clear_on_submit=False):
+            email_inputs = {}
+            for p in all_persons:
+                email_inputs[p] = st.text_input(
+                    p, value=email_map.get(p, ""), key=f"email_{p}"
+                )
+            if st.form_submit_button("💾 Save Emails", type="primary"):
+                con = get_con()
+                for p, em in email_inputs.items():
+                    em = em.strip()
+                    if em:
+                        con.execute(
+                            "INSERT OR REPLACE INTO person_emails VALUES (?, ?)", [p, em]
+                        )
+                    else:
+                        con.execute(
+                            "DELETE FROM person_emails WHERE person_label = ?", [p]
+                        )
+                con.execute("CHECKPOINT")
+                st.success("✅ Email addresses saved.")
+                st.rerun()
+
+        # ── Send Reminders ─────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Send Reminders")
+
+        # Refresh email map after possible save
+        pe_fresh = run_query("SELECT * FROM person_emails")
+        em_map_fresh = dict(zip(pe_fresh["person_label"], pe_fresh["email"])) if not pe_fresh.empty else {}
+
+        def _build_person_html(person: str, row: pd.Series) -> str:
+            return f"""
+            <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
+              <h2 style="color:#E20074">T-Mobile Bill – Balance Reminder</h2>
+              <p>Hi <strong>{person}</strong>,</p>
+              <p>This is a friendly reminder about your T-Mobile bill share.</p>
+              <table style="border-collapse:collapse;width:100%">
+                <tr><td style="padding:8px;border:1px solid #ddd"><strong>Total Owed</strong></td>
+                    <td style="padding:8px;border:1px solid #ddd;text-align:right">${row['total_owed']:,.2f}</td></tr>
+                <tr><td style="padding:8px;border:1px solid #ddd"><strong>Total Paid</strong></td>
+                    <td style="padding:8px;border:1px solid #ddd;text-align:right">${row['total_paid']:,.2f}</td></tr>
+                <tr style="background:#FFF0F5"><td style="padding:8px;border:1px solid #ddd"><strong>Balance Due</strong></td>
+                    <td style="padding:8px;border:1px solid #ddd;text-align:right;color:#E20074;font-weight:bold">${row['balance']:,.2f}</td></tr>
+              </table>
+              <p style="margin-top:16px">If you've already made a payment, please disregard this.<br>
+              Please reach out to <strong>{_ACCT_HOLDER}</strong> for payment details.</p>
+              <p style="color:#888;font-size:12px">Sent from <a href="{_APP_URL}">T-Mobile Bill Tracker</a></p>
+            </div>"""
+
+        def _build_master_html() -> str:
+            rows_html = ""
+            for _, r in balance_df.iterrows():
+                bg = ' style="background:#FFF0F5"' if r["balance"] > 0 else ""
+                rows_html += f"""<tr{bg}>
+                    <td style="padding:6px;border:1px solid #ddd">{r['person_label']}</td>
+                    <td style="padding:6px;border:1px solid #ddd;text-align:right">${r['total_owed']:,.2f}</td>
+                    <td style="padding:6px;border:1px solid #ddd;text-align:right">${r['total_paid']:,.2f}</td>
+                    <td style="padding:6px;border:1px solid #ddd;text-align:right;font-weight:bold">${r['balance']:,.2f}</td>
+                </tr>"""
+            total_out = balance_df["balance"].sum()
+            return f"""
+            <div style="font-family:Arial,sans-serif;max-width:650px;margin:auto">
+              <h2 style="color:#E20074">T-Mobile Bill – Weekly Balance Summary</h2>
+              <p>Hi <strong>{_ACCT_HOLDER}</strong>,</p>
+              <p>Here is the current balance summary for all members:</p>
+              <table style="border-collapse:collapse;width:100%">
+                <tr style="background:#E20074;color:white">
+                  <th style="padding:8px;border:1px solid #ddd;text-align:left">Person</th>
+                  <th style="padding:8px;border:1px solid #ddd;text-align:right">Total Owed</th>
+                  <th style="padding:8px;border:1px solid #ddd;text-align:right">Total Paid</th>
+                  <th style="padding:8px;border:1px solid #ddd;text-align:right">Balance Due</th>
+                </tr>
+                {rows_html}
+                <tr style="background:#333;color:white">
+                  <td style="padding:8px;border:1px solid #ddd"><strong>TOTAL</strong></td>
+                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${balance_df['total_owed'].sum():,.2f}</strong></td>
+                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${balance_df['total_paid'].sum():,.2f}</strong></td>
+                  <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${total_out:,.2f}</strong></td>
+                </tr>
+              </table>
+              <p style="margin-top:16px"><a href="{_APP_URL}">Open Dashboard →</a></p>
+              <p style="color:#888;font-size:12px">Sent from T-Mobile Bill Tracker</p>
+            </div>"""
+
+        # Send to Sathish (master summary)
+        ec1, ec2 = st.columns(2)
+        sathish_email = em_map_fresh.get(_ACCT_HOLDER, "")
+        with ec1:
+            if st.button(f"📧 Send Master Summary to {_ACCT_HOLDER}", type="primary",
+                         disabled=not sathish_email):
+                ok, msg = _send_sg_email(
+                    sathish_email, _ACCT_HOLDER,
+                    "T-Mobile Bill – Weekly Balance Summary",
+                    _build_master_html(),
+                )
+                if ok:
+                    st.success(f"✅ Master summary sent to {sathish_email}")
+                else:
+                    st.error(f"❌ {msg}")
+            if not sathish_email:
+                st.caption(f"⚠️ No email set for {_ACCT_HOLDER}.")
+
+        # Send to individual with outstanding balance
+        with ec2:
+            with_balance = balance_df[balance_df["balance"] > 0]["person_label"].tolist()
+            emailable = [p for p in with_balance if p in em_map_fresh]
+            if emailable:
+                send_person = st.selectbox("Send reminder to", emailable, key="send_ind")
+                if st.button("📧 Send Individual Reminder", key="send_ind_btn"):
+                    row = balance_df[balance_df["person_label"] == send_person].iloc[0]
+                    ok, msg = _send_sg_email(
+                        em_map_fresh[send_person], send_person,
+                        "T-Mobile Bill – Balance Reminder",
+                        _build_person_html(send_person, row),
+                    )
+                    if ok:
+                        st.success(f"✅ Reminder sent to {send_person} ({em_map_fresh[send_person]})")
+                    else:
+                        st.error(f"❌ {msg}")
+            else:
+                st.info("No persons with outstanding balance and configured email.")
+
+        # Send all reminders
+        st.markdown("---")
+        if st.button("📧 Send ALL Reminders (Master + Individual)", key="send_all_btn"):
+            results = []
+            # Master to Sathish
+            if sathish_email:
+                ok, msg = _send_sg_email(
+                    sathish_email, _ACCT_HOLDER,
+                    "T-Mobile Bill – Weekly Balance Summary",
+                    _build_master_html(),
+                )
+                results.append((_ACCT_HOLDER, ok, msg))
+            # Individual reminders
+            for _, r in balance_df.iterrows():
+                p = r["person_label"]
+                if p in em_map_fresh and r["balance"] > 0:
+                    ok, msg = _send_sg_email(
+                        em_map_fresh[p], p,
+                        "T-Mobile Bill – Balance Reminder",
+                        _build_person_html(p, r),
+                    )
+                    results.append((p, ok, msg))
+            for name, ok, msg in results:
+                if ok:
+                    st.success(f"✅ {name}: Sent")
+                else:
+                    st.error(f"❌ {name}: {msg}")
 
 
 # ════════════════════════════════════════════════════════════════════

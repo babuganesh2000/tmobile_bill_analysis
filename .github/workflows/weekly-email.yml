@@ -1,0 +1,31 @@
+name: Weekly Bill Reminder
+
+on:
+  schedule:
+    # Every Monday at 9:00 AM US Central (14:00 UTC during CDT, 15:00 UTC during CST)
+    - cron: "0 14 * * 1"
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install duckdb pandas requests
+
+      - name: Send weekly email
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SENDGRID_FROM_EMAIL: ${{ secrets.SENDGRID_FROM_EMAIL }}
+        run: |
+          python send_weekly_email.py
