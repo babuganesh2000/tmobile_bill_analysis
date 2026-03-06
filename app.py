@@ -1701,29 +1701,30 @@ elif page == "Balances":
 
     _APP_URL = "https://tmobilebillanalysis-w8t9cas3jwk6u4cc6qqwea.streamlit.app"
 
-    # ── helper: send email via SendGrid ────────────────────────────
-    def _send_sg_email(to_email: str, to_name: str, subject: str, html: str):
-        sg = st.secrets.get("sendgrid", {})
-        api_key = sg.get("api_key", "")
-        from_email = sg.get("from_email", "")
+    # ── helper: send email via Resend ──────────────────────────────
+    def _send_email(to_email: str, to_name: str, subject: str, html: str):
+        rs = st.secrets.get("resend", {})
+        api_key = rs.get("api_key", "")
+        from_email = rs.get("from_email", "")
         if not api_key or "YOUR_" in api_key:
-            return False, "SendGrid API key not configured in secrets."
+            return False, "Resend API key not configured in secrets."
         if not from_email:
             return False, "Sender email not configured in secrets."
+        to_value = f"{to_name} <{to_email}>" if to_name else to_email
         resp = _requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
+            "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "personalizations": [{"to": [{"email": to_email, "name": to_name}]}],
-                "from": {"email": from_email, "name": "T-Mobile Bill Tracker"},
+                "from": f"T-Mobile Bill Tracker <{from_email}>",
+                "to": [to_value],
                 "subject": subject,
-                "content": [{"type": "text/html", "value": html}],
+                "html": html,
             },
             timeout=15,
         )
         if resp.status_code in (200, 201, 202):
             return True, "Sent"
-        return False, f"SendGrid error {resp.status_code}: {resp.text[:200]}"
+        return False, f"Resend error {resp.status_code}: {resp.text[:200]}"
 
     # ── Load accounts & settlements ────────────────────────────────
     _accts_df = run_query("SELECT * FROM accounts ORDER BY account_type, account_name")
@@ -2409,7 +2410,7 @@ elif page == "Balances":
                           <p style="color:#888;font-size:12px">Sent from <a href="{_APP_URL}">T-Mobile Bill Tracker</a></p>
                         </div>"""
 
-                        ok, msg = _send_sg_email(em_email, em_name,
+                        ok, msg = _send_email(em_email, em_name,
                                                  f"T-Mobile Bill – {', '.join(em_months)}", html_body)
                         if ok:
                             st.success(f"✅ Email sent to **{em_name}** ({em_email})")
@@ -2477,7 +2478,7 @@ elif page == "Balances":
                               </table>
                               <p style="margin-top:16px"><a href="{_APP_URL}">Open Dashboard →</a></p>
                             </div>"""
-                            ok, msg = _send_sg_email(admin_email, _ADMIN_LABEL,
+                            ok, msg = _send_email(admin_email, _ADMIN_LABEL,
                                                      f"T-Mobile Master Summary – {', '.join(ms_months)}", ms_html)
                             if ok:
                                 st.success(f"✅ Master summary sent to {admin_email}")
