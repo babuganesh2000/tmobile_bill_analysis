@@ -1703,6 +1703,7 @@ elif page == "Balances":
 
     # ── helper: send email via Resend ──────────────────────────────
     def _send_email(to_email: str, to_name: str, subject: str, html: str):
+        from email.utils import parseaddr, formataddr
         rs = st.secrets.get("resend", {})
         api_key = rs.get("api_key", "")
         from_email = rs.get("from_email", "")
@@ -1711,9 +1712,20 @@ elif page == "Balances":
         if not from_email:
             return False, "Sender email not configured in secrets."
         to_value = f"{to_name} <{to_email}>" if to_name else to_email
-        from_value = str(from_email).strip()
-        if "<" not in from_value and ">" not in from_value:
-            from_value = f"T-Mobile Bill Tracker <{from_value}>"
+        raw_from = str(from_email).strip().strip("\"'")
+        disp_name, from_addr = parseaddr(raw_from)
+        if not from_addr or "@" not in from_addr:
+            return (
+                False,
+                f"Invalid resend.from_email format: {raw_from!r}. "
+                "Use email@example.com or Name <email@example.com>.",
+            )
+        # For resend.dev sandbox sender, keep a plain address.
+        # For custom domains, include a default display name when one isn't provided.
+        if from_addr.lower().endswith("@resend.dev"):
+            from_value = from_addr
+        else:
+            from_value = formataddr((disp_name or "T-Mobile Bill Tracker", from_addr))
         resp = _requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
