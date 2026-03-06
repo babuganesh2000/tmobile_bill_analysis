@@ -1711,11 +1711,14 @@ elif page == "Balances":
         if not from_email:
             return False, "Sender email not configured in secrets."
         to_value = f"{to_name} <{to_email}>" if to_name else to_email
+        from_value = str(from_email).strip()
+        if "<" not in from_value and ">" not in from_value:
+            from_value = f"T-Mobile Bill Tracker <{from_value}>"
         resp = _requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "from": f"T-Mobile Bill Tracker <{from_email}>",
+                "from": from_value,
                 "to": [to_value],
                 "subject": subject,
                 "html": html,
