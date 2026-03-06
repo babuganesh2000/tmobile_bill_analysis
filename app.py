@@ -1806,6 +1806,110 @@ elif page == "Balances":
         ).fillna(bal_all["phone_number"])
 
     _all_months = sorted(bal_all["month"].unique().tolist(), reverse=True) if not bal_all.empty else []
+    _month_rank = {m: i for i, m in enumerate(_all_months)}
+
+    def _sort_selected_months(months):
+        return sorted(months or [], key=lambda m: _month_rank.get(m, 9999))
+
+    def _send_primary_bill_email(primary_phone, months, notes):
+        if not months:
+            return False, "Select at least one month."
+        if not primary_phone:
+            return False, "Select a primary account."
+
+        family = _get_family_phones(primary_phone)
+        em_data = bal_all[
+            (bal_all["phone_number"].isin(family)) &
+            (bal_all["month"].isin(months))
+        ].copy() if not bal_all.empty else pd.DataFrame()
+        if em_data.empty:
+            return False, "No bill data for this account in the selected months."
+
+        em_name = _acct_map[primary_phone]["name"]
+        em_email = (_acct_map[primary_phone].get("email") or "").strip()
+        if not em_email:
+            return False, f"No email configured for {em_name}."
+
+        em_mo = em_data.groupby("month")["month_total"].sum().reset_index()
+        stl_em = _stl_df[
+            (_stl_df["primary_phone"] == primary_phone) &
+            (_stl_df["bill_month"].isin(months))
+        ] if not _stl_df.empty else pd.DataFrame()
+        stl_em_sum = stl_em.groupby("bill_month")["amount"].sum().to_dict() if not stl_em.empty else {}
+
+        mem_detail = em_data.groupby(["person_label", "phone_number"])["month_total"].sum().reset_index()
+        mem_detail["relationship"] = mem_detail["phone_number"].map(
+            lambda ph: _acct_map.get(ph, {}).get("relationship", "-")
+        )
+
+        months_rows = ""
+        grand_owed = grand_paid = 0
+        for _, mr in em_mo.iterrows():
+            m = mr["month"]
+            owed = mr["month_total"]
+            paid = stl_em_sum.get(m, 0)
+            bal = owed - paid
+            grand_owed += owed
+            grand_paid += paid
+            bg = ' style="background:#FFF0F5"' if bal > 0 else ""
+            months_rows += f"""<tr{bg}>
+                <td style="padding:6px;border:1px solid #ddd">{m}</td>
+                <td style="padding:6px;border:1px solid #ddd;text-align:right">${owed:,.2f}</td>
+                <td style="padding:6px;border:1px solid #ddd;text-align:right">${paid:,.2f}</td>
+                <td style="padding:6px;border:1px solid #ddd;text-align:right;font-weight:bold">${bal:,.2f}</td>
+            </tr>"""
+        grand_bal = grand_owed - grand_paid
+
+        members_rows = ""
+        for _, md in mem_detail.iterrows():
+            members_rows += f"""<tr>
+                <td style="padding:5px;border:1px solid #ddd">{md['person_label']}</td>
+                <td style="padding:5px;border:1px solid #ddd">{md['phone_number']}</td>
+                <td style="padding:5px;border:1px solid #ddd">{md['relationship']}</td>
+                <td style="padding:5px;border:1px solid #ddd;text-align:right">${md['month_total']:,.2f}</td>
+            </tr>"""
+
+        notes_html = (f'<div style="background:#FFFDE7;padding:12px;border-left:4px solid #FFB900;'
+                      f'margin:16px 0"><strong>Note:</strong> {notes}</div>'
+                      if notes.strip() else "")
+
+        html_body = f"""
+        <div style="font-family:Arial,sans-serif;max-width:650px;margin:auto">
+          <h2 style="color:#E20074">T-Mobile Bill Summary</h2>
+          <p>Hi <strong>{em_name}</strong>,</p>
+          <p>Here is your T-Mobile bill share for <strong>{', '.join(months)}</strong>:</p>
+          {notes_html}
+          <h3 style="color:#333">Monthly Breakdown</h3>
+          <table style="border-collapse:collapse;width:100%">
+            <tr style="background:#E20074;color:white">
+              <th style="padding:8px;border:1px solid #ddd;text-align:left">Month</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:right">Owed</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:right">Paid</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:right">Balance</th>
+            </tr>
+            {months_rows}
+            <tr style="background:#333;color:white">
+              <td style="padding:8px;border:1px solid #ddd"><strong>TOTAL</strong></td>
+              <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${grand_owed:,.2f}</strong></td>
+              <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${grand_paid:,.2f}</strong></td>
+              <td style="padding:8px;border:1px solid #ddd;text-align:right"><strong>${grand_bal:,.2f}</strong></td>
+            </tr>
+          </table>
+          <h3 style="color:#333;margin-top:20px">Your Lines</h3>
+          <table style="border-collapse:collapse;width:100%">
+            <tr style="background:#666;color:white">
+              <th style="padding:6px;border:1px solid #ddd">Name</th>
+              <th style="padding:6px;border:1px solid #ddd">Phone</th>
+              <th style="padding:6px;border:1px solid #ddd">Relation</th>
+              <th style="padding:6px;border:1px solid #ddd;text-align:right">Total</th>
+            </tr>
+            {members_rows}
+          </table>
+          <p style="margin-top:16px">Please reach out to <strong>{_ADMIN_LABEL}</strong> for payment details.</p>
+          <p style="color:#888;font-size:12px">Sent from <a href="{_APP_URL}">T-Mobile Bill Tracker</a></p>
+        </div>"""
+
+        return _send_email(em_email, em_name, f"T-Mobile Bill – {', '.join(months)}", html_body)
 
     # ━━━━ TABS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     tab_accts, tab_summary, tab_pay, tab_history, tab_email = st.tabs([
@@ -2069,6 +2173,11 @@ elif page == "Balances":
             "Filter by months (leave empty = all months)", _all_months,
             key="bal_month_filter",
         )
+        sorted_month_filter = _sort_selected_months(month_filter)
+        if month_filter != sorted_month_filter:
+            st.session_state["bal_month_filter"] = sorted_month_filter
+            st.rerun()
+        month_filter = sorted_month_filter
 
         if bal_all.empty:
             st.info("No bill data.")
@@ -2234,6 +2343,32 @@ elif page == "Balances":
                             }),
                             use_container_width=True, hide_index=True,
                         )
+
+                        st.markdown("**Email This Account:**")
+                        dd_email = (_acct_map.get(sel_dd_ph, {}).get("email") or "").strip()
+                        if dd_email:
+                            dd_default_months = _sort_selected_months(month_filter) if month_filter else []
+                            dd_months = st.multiselect(
+                                "Select months to include in email",
+                                _all_months,
+                                default=dd_default_months,
+                                key="dd_em_months",
+                            )
+                            dd_months = _sort_selected_months(dd_months)
+                            dd_notes = st.text_area(
+                                "Personal note (optional)",
+                                height=80,
+                                key="dd_em_notes",
+                                placeholder="e.g. Please pay by March 15 via Zelle.",
+                            )
+                            if st.button("📧 Send Email to this account", type="primary", key="dd_em_send_btn"):
+                                ok, msg = _send_primary_bill_email(sel_dd_ph, dd_months, dd_notes)
+                                if ok:
+                                    st.success(f"✅ Email sent to **{_acct_map[sel_dd_ph]['name']}** ({dd_email})")
+                                else:
+                                    st.error(f"❌ {msg}")
+                        else:
+                            st.info("No email configured for this account. Set it in Account Management.")
                     else:
                         st.info("No charge data for the selected filters / account.")
 
@@ -2329,6 +2464,7 @@ elif page == "Balances":
             em_sel = st.selectbox("Send to", list(_em_map.keys()), key="em_acct_sel")
             em_ph = _em_map.get(em_sel, "") if em_sel else ""
             em_months = st.multiselect("Select months to include", _all_months, key="em_months")
+            em_months = _sort_selected_months(em_months)
             em_notes = st.text_area("Personal note (included in the email)", height=80, key="em_notes",
                                     placeholder="e.g. Please pay by March 15th via Zelle to ...")
 
@@ -2441,6 +2577,7 @@ elif page == "Balances":
             admin_email = _acct_map.get(_admin_phone, {}).get("email", "") if _admin_phone else ""
             if admin_email and _all_months:
                 ms_months = st.multiselect("Months for summary", _all_months, key="ms_months")
+                ms_months = _sort_selected_months(ms_months)
                 if st.button(f"📧 Send Master Summary to {_ADMIN_LABEL}", key="ms_send"):
                     if not ms_months:
                         st.warning("Select at least one month.")
@@ -2619,4 +2756,3 @@ elif page == "Phone Directory":
             bills_con.execute("CHECKPOINT")
             st.success(f"✅ Saved {changes} name(s) and rebuilt person mapping.")
             st.rerun()
-
