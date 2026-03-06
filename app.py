@@ -1696,50 +1696,53 @@ elif page == "Balances":
         st.error("Admin access required.")
         st.stop()
 
-    import requests as _requests
+    import smtplib
+    from email.message import EmailMessage
+    from email.utils import parseaddr, formataddr
     from datetime import date as _date, datetime as _datetime
 
     _APP_URL = "https://tmobilebillanalysis-w8t9cas3jwk6u4cc6qqwea.streamlit.app"
 
-    # ── helper: send email via Resend ──────────────────────────────
+    # ── helper: send email via Gmail SMTP ──────────────────────────
     def _send_email(to_email: str, to_name: str, subject: str, html: str):
-        from email.utils import parseaddr, formataddr
-        rs = st.secrets.get("resend", {})
-        api_key = rs.get("api_key", "")
-        from_email = rs.get("from_email", "")
-        if not api_key or "YOUR_" in api_key:
-            return False, "Resend API key not configured in secrets."
-        if not from_email:
-            return False, "Sender email not configured in secrets."
+        gs = st.secrets.get("gmail_smtp", {})
+        username = str(gs.get("username", "")).strip()
+        app_password = str(gs.get("app_password", "")).strip().replace(" ", "")
+        from_email = str(gs.get("from_email", "")).strip() or username
+        from_name = str(gs.get("from_name", "T-Mobile Bill Tracker")).strip()
+
+        if not username or "YOUR_" in username:
+            return False, "Gmail SMTP username not configured in secrets."
+        if not app_password or "YOUR_" in app_password:
+            return False, "Gmail SMTP app password not configured in secrets."
+
         to_value = f"{to_name} <{to_email}>" if to_name else to_email
         raw_from = str(from_email).strip().strip("\"'")
         disp_name, from_addr = parseaddr(raw_from)
         if not from_addr or "@" not in from_addr:
             return (
                 False,
-                f"Invalid resend.from_email format: {raw_from!r}. "
+                f"Invalid gmail_smtp.from_email format: {raw_from!r}. "
                 "Use email@example.com or Name <email@example.com>.",
             )
-        # For resend.dev sandbox sender, keep a plain address.
-        # For custom domains, include a default display name when one isn't provided.
-        if from_addr.lower().endswith("@resend.dev"):
-            from_value = from_addr
-        else:
-            from_value = formataddr((disp_name or "T-Mobile Bill Tracker", from_addr))
-        resp = _requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "from": from_value,
-                "to": [to_value],
-                "subject": subject,
-                "html": html,
-            },
-            timeout=15,
-        )
-        if resp.status_code in (200, 201, 202):
+        from_value = formataddr((disp_name or from_name, from_addr))
+
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = from_value
+        msg["To"] = to_value
+        msg.set_content("This email requires an HTML-compatible mail client.")
+        msg.add_alternative(html, subtype="html")
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+                server.login(username, app_password)
+                server.send_message(msg)
             return True, "Sent"
-        return False, f"Resend error {resp.status_code}: {resp.text[:200]}"
+        except smtplib.SMTPAuthenticationError:
+            return False, "Gmail authentication failed. Verify username and app password."
+        except Exception as exc:
+            return False, f"Gmail SMTP error: {str(exc)[:200]}"
 
     # ── Load accounts & settlements ────────────────────────────────
     _accts_df = run_query("SELECT * FROM accounts ORDER BY account_type, account_name")
