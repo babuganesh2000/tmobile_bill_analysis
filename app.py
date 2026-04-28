@@ -1748,6 +1748,11 @@ elif page == "Balances":
     _accts_df = run_query("SELECT * FROM accounts ORDER BY account_type, account_name")
     _stl_df   = run_query("SELECT * FROM settlements ORDER BY payment_date DESC")
 
+    def _clean_optional_text(value):
+        if value is None or pd.isna(value):
+            return ""
+        return str(value).strip()
+
     # Lookup maps
     _acct_map = {}        # phone -> full row dict
     _primary_phones = []  # list of primary phone numbers
@@ -1756,7 +1761,7 @@ elif page == "Balances":
         _acct_map[ar["phone_number"]] = {
             "name": ar["account_name"], "type": ar["account_type"],
             "primary_phone": ar["primary_phone"], "relationship": ar["relationship"],
-            "email": ar["contact_email"], "is_admin": ar["is_admin"],
+            "email": _clean_optional_text(ar["contact_email"]), "is_admin": ar["is_admin"],
         }
         if ar["account_type"] == "Primary":
             _primary_phones.append(ar["phone_number"])
