@@ -2245,8 +2245,10 @@ elif page == "Balances":
                             return "color: #00C853; font-weight: bold"
                     return ""
 
+                styler = disp[disp_cols].style
+                style_map = styler.map if hasattr(styler, "map") else styler.applymap
                 st.dataframe(
-                    disp[disp_cols].style.applymap(_color_bal, subset=["Balance Due"]).format(
+                    style_map(_color_bal, subset=["Balance Due"]).format(
                         {"Total Owed": "${:,.2f}", "Total Paid": "${:,.2f}", "Balance Due": "${:,.2f}"}
                     ),
                     use_container_width=True, hide_index=True,
